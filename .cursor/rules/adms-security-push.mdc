@@ -1,0 +1,41 @@
+---
+description: F22 ADMS 연동 — Security PUSH 20240712 PDF를 정식 프로토콜 기준으로 사용
+globs: meal_db/adms*.py,meal_db/f22_sync.py,pc_app.py,docs/adms/**
+alwaysApply: false
+---
+
+# ADMS / Security PUSH (정식 문서 우선)
+
+## 정식 참조 (필수)
+
+ADMS·HTTP PUSH·getrequest·사용자/지문 단말 등록 작업 시 **반드시** 아래를 기준으로 한다:
+
+1. **PDF 원본:** `docs/adms/Security_PUSH_Communication_Protocol_20240712.pdf`
+2. **검색 인덱스:** `docs/adms/Security_PUSH_20240712_index.txt`
+3. **치트시트:** `docs/adms/COMMAND_REFERENCE.md`
+4. **개요:** `docs/adms/README.md`
+
+## 사용 금지 (ADMS 모드)
+
+- **pyzk** / TCP **4370** 프로토콜 문서·API — `MEAL_F22_ATT_MODE=live|poll` 전용
+- 구형 Pull PUSH **`USERINFO` / `FINGERTMP`** — Security PUSH 단말(F22 ADMS)과 다름
+- GitHub `zkteco-adms` 등 서드파티 예제는 PDF와 충돌 시 **PDF 우선**
+
+## Security PUSH 명령 (20240712)
+
+| 용도 | 테이블/형식 |
+|------|-------------|
+| 사용자 | `DATA UPDATE user` — `CardNo`, `Pin`, `Name`, `Privilege`, … |
+| 지문 | `DATA UPDATE templatev10` — `Pin`, `FingerID`, `Valid`, `Template`(base64) |
+| getrequest | `C:{ID}:{명령}\n` (끝에 `OK` 붙이지 않음) |
+| 결과 | `POST /iclock/devicecmd` — `ID`, `Return`, `CMD` |
+
+기본 env: `MEAL_ADMS_CMD_PROTOCOL=security`
+
+## 구현 파일
+
+- `meal_db/adms_push_server.py` — `/iclock/*` HTTP 서버
+- `meal_db/adms_commands.py` — 명령 문자열·큐
+- `meal_db/adms_user_sync.py` — 사원 DB → 단말 sync
+
+명령 형식 변경 시 PDF §8.1(getrequest), §9.1.1(user/templatev10)과 `COMMAND_REFERENCE.md`를 함께 갱신한다.

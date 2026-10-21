@@ -1,0 +1,6 @@
+PyQt5
+mariadb>=1.1.0
+pyzk>=0.9
+pyzkfp>=0.1.5
+pythonnet>=3.0
+Pillow>=9.0
