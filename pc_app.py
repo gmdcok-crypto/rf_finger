@@ -19,7 +19,7 @@ except Exception:
 
 import bixolon_print
 
-from fp_register_ui import FingerprintRegisterDialog, dark_information, dark_warning
+from fp_register_ui import FingerprintRegisterDialog, dark_information, dark_question, dark_warning
 
 from meal_db.local_client import terminal_attendance_stable_key, _db_time_as_time
 from datetime import datetime, date, timedelta
@@ -30,7 +30,48 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QDialog, QFormLayout, QMessageBox, QInputDialog, QStyledItemDelegate, QTimeEdit, QDateEdit, QCalendarWidget, QLayout, QPlainTextEdit, QSizePolicy,     QCheckBox, QSpinBox, QGroupBox, QProgressBar, QRadioButton, QButtonGroup, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer, QThread, QTime, QDate, QByteArray, QObject, QEvent
-from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QResizeEvent, QImage
+from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QResizeEvent, QImage, QPainter
+
+class CaptionPushButton(QPushButton):
+    """본문 바로 아래에 더 작은 안내 글자를 그리는 버튼."""
+
+    def __init__(self, title: str, caption: str, parent=None):
+        super().__init__("", parent)
+        self._title = title
+        self._caption = caption
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        color = QColor("#f8fafc" if self.isEnabled() else "#64748b")
+        rect = self.rect().adjusted(6, 4, -6, -4)
+        title_font = QFont("Malgun Gothic")
+        title_font.setPixelSize(19)
+        title_font.setBold(True)
+        cap_font = QFont("Malgun Gothic")
+        cap_font.setPixelSize(12)
+        cap_font.setBold(True)
+        painter.setFont(title_font)
+        title_h = painter.fontMetrics().height()
+        painter.setFont(cap_font)
+        cap_h = painter.fontMetrics().height()
+        gap = 0
+        total = title_h + gap + cap_h
+        y = rect.top() + max(0, (rect.height() - total) // 2)
+        painter.setPen(color)
+        painter.setFont(title_font)
+        painter.drawText(
+            rect.left(), y, rect.width(), title_h,
+            Qt.AlignHCenter | Qt.AlignVCenter, self._title,
+        )
+        painter.setFont(cap_font)
+        painter.drawText(
+            rect.left(), y + title_h + gap, rect.width(), cap_h,
+            Qt.AlignHCenter | Qt.AlignVCenter, self._caption,
+        )
+        painter.end()
+
 
 # --- Worker Thread for Async Data Loading ---
 class DataLoader(QThread):
@@ -94,6 +135,44 @@ def _device_status_task(api, main_win=None):
     if _f22_att_mode_is_adms():
         return _build_adms_status_report(main_win, api)
     return _device_ping_task(api)
+
+
+def _tcp_port_open(host: str, port: int, timeout: float = 1.2) -> bool:
+    """프린터·경광등 IP:포트에 TCP 접속이 되는지만 확인한다. 제어 명령은 보내지 않는다."""
+    import socket
+
+    ip = (host or "").strip()
+    if not ip:
+        return False
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        return False
+    if not (1 <= port_i <= 65535):
+        return False
+    try:
+        with socket.create_connection((ip, port_i), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _probe_printer_qlight(printers, qlights) -> dict:
+    """{"ip:port": bool} — 같은 주소는 한 번만 확인."""
+    out = {}
+    for row in list(printers or []) + list(qlights or []):
+        if not isinstance(row, dict):
+            continue
+        ip = str(row.get("ip") or "").strip()
+        try:
+            port = int(row.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        key = "%s:%s" % (ip, port)
+        if not ip or key in out:
+            continue
+        out[key] = _tcp_port_open(ip, port)
+    return out
 
 
 def render_terminal_status_rows(layout, rep, conn_icon=None, disconn_icon=None, *, compact=False):
@@ -364,69 +443,68 @@ def _f22_import_from_terminal_task(api, emp_no: str):
     return import_fingerprint_templates_from_f22_terminal(emp_no)
 
 
-def _f22_install_location_for_ip(settings, ip_str: str) -> str:
-    """device_settings.f22_terminals 에서 IP에 해당하는 설치위치."""
-    if not isinstance(settings, dict):
-        return ""
-    terminals = settings.get("f22_terminals")
-    if not isinstance(terminals, list):
-        return ""
-    ip_s = str(ip_str or "").strip()
-    for t in terminals:
-        if not isinstance(t, dict):
-            continue
-        tip = (t.get("ip") or t.get("host") or "").strip()
-        if tip == ip_s:
-            return str(t.get("install_location") or "").strip()
-    return ""
+def _sync_result_terminal_name(settings, key) -> str:
+    """결과의 IP·단말기번호만 있어도 설정에서 번호·설치위치·IP로 풀어 준다."""
+    from meal_db.f22_sync import sync_terminal_name
+
+    raw = str(key or "").strip()
+    terminals = settings.get("f22_terminals") if isinstance(settings, dict) else None
+    if isinstance(terminals, list):
+        for t in terminals:
+            if not isinstance(t, dict):
+                continue
+            ip = str(t.get("ip") or t.get("host") or "").strip()
+            dno = str(t.get("device_no") or t.get("terminal_no") or "").strip()
+            if raw and raw in (ip, dno):
+                return sync_terminal_name(t)
+    return raw or "단말"
 
 
-def _f22_sync_fail_location_messages(settings, results) -> list:
-    """통신 실패한 단말에 대해 '{설치위치}단말기 연결상태를 확인하세요' 목록 (중복 제거)."""
-    out = []
-    seen = set()
-    for row in results or []:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        ip, ok_r = row[0], row[1]
-        if ok_r:
-            continue
-        loc = _f22_install_location_for_ip(settings, ip)
-        hint = ("%s단말기 연결상태를 확인하세요" % loc) if loc else ("단말기 연결상태를 확인하세요 (%s)" % ip)
-        if hint not in seen:
-            seen.add(hint)
-            out.append(hint)
-    return out
-
-
-def _f22_fingerprint_sync_dialog_text(api, results) -> str:
-    """지문 DB 반영 후 단말 동기화 결과용 다이얼로그 본문."""
+def _f22_sync_result_lines(api, results) -> tuple:
+    """(실패 목록, 성공 목록). 각 항목은 (단말이름, 메시지)."""
     try:
         settings = api.get_device_settings()
     except Exception:
         settings = {}
-    parts = ["DB, 단말기 적용 완료"]
-    if not results:
-        parts.append("")
-        parts.append("등록된 F22 단말이 없어 추가 전송은 하지 않았습니다.")
-        return "\n".join(parts)
-    all_ok = all(
-        isinstance(r, (list, tuple)) and len(r) >= 2 and r[1] for r in results
-    )
-    if all_ok:
-        return "\n".join(parts)
-    hints = _f22_sync_fail_location_messages(settings, results)
-    if hints:
-        parts.append("")
-        parts.extend(hints)
-    parts.append("")
-    parts.append("— 상세 —")
-    for row in results:
-        if not isinstance(row, (list, tuple)) or len(row) < 3:
+    fails = []
+    oks = []
+    for row in results or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
             continue
-        ip, ok_r, msg = row[0], row[1], row[2]
-        parts.append("%s — %s" % (ip, msg))
-    return "\n".join(parts)
+        name = _sync_result_terminal_name(settings, row[0])
+        msg = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+        if row[1]:
+            oks.append((name, msg))
+        else:
+            fails.append((name, msg))
+    return fails, oks
+
+
+def _f22_fingerprint_sync_dialog_text(api, results) -> str:
+    """등록·수정·지문 저장 후 단말 동기화 결과."""
+    fails, oks = _f22_sync_result_lines(api, results)
+    if not fails and not oks:
+        return "DB에는 저장되었습니다.\n\n등록된 F22 단말이 없어 단말 전송은 하지 않았습니다."
+    lines = []
+    if fails:
+        lines.append("DB에는 저장되었습니다. 아래 단말에는 전송되지 않았습니다.")
+        lines.append("실패 %d대 · 성공 %d대" % (len(fails), len(oks)))
+        lines.append("")
+        lines.append("동기화되지 않은 단말")
+        for name, msg in fails:
+            lines.append("· %s" % name)
+            if msg:
+                lines.append("  %s" % msg)
+        if oks:
+            lines.append("")
+            lines.append("동기화된 단말")
+            for name, _msg in oks:
+                lines.append("· %s" % name)
+    else:
+        lines.append("DB 저장 완료. 단말 %d대 동기화됨" % len(oks))
+        for name, _msg in oks:
+            lines.append("· %s" % name)
+    return "\n".join(lines)
 
 
 def _f22_sync_after_terminal_import_task(api, emp_row: dict):
@@ -530,7 +608,13 @@ def _f22_bulk_resync_dialog_text(summary: dict) -> str:
     ok = int(summary.get("ok_emp") or 0)
     fail = int(summary.get("fail_emp") or 0)
     skip = int(summary.get("skip_emp") or 0)
-    lines = ["처리 대상 %d명 — 성공 %d · 실패 %d · 건너뜀 %d" % (total, ok, fail, skip)]
+    lines = [
+        "처리 대상 %d명 — 성공 %d · 실패 %d · 건너뜀 %d" % (total, ok, fail, skip),
+        "단말에서 삭제 %d명" % int(summary.get("deleted_emp") or 0),
+    ]
+    kept_admin = int(summary.get("kept_admin") or 0)
+    if kept_admin:
+        lines.append("단말 관리자 계정 %d명은 삭제하지 않았습니다." % kept_admin)
     if summary.get("cancelled"):
         lines.append("")
         lines.append("취소되어 남은 사원은 처리하지 않았습니다.")
@@ -822,7 +906,7 @@ class EmployeeSearchDialog(QDialog):
         self.main_win = main_win
         self.selected_employee = None
         self.setWindowTitle("사원 검색")
-        self.setMinimumSize(600, 500)
+        self.setMinimumSize(760, 500)
         self.setStyleSheet(QSS)
         
         layout = QVBoxLayout(self)
@@ -845,8 +929,8 @@ class EmployeeSearchDialog(QDialog):
         layout.addLayout(search_layout)
         
         # Table area
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["사번", "성명", "부서", "회사"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["사번", "성명", "부서", "회사", "카드 UID"])
         setup_standard_table(self.table)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -889,12 +973,12 @@ class EmployeeSearchDialog(QDialog):
         self.results = data
         self.table.setRowCount(len(data))
         
-        comp_map = {c["id"]: c["name"] for c in self.main_win.companies_data if isinstance(c, dict)}
-        dept_map = {d["id"]: d["name"] for d in self.main_win.departments_data if isinstance(d, dict)}
+        comp_map = {c["code"]: c["name"] for c in self.main_win.companies_data if isinstance(c, dict)}
+        dept_map = {d["code"]: d["name"] for d in self.main_win.departments_data if isinstance(d, dict)}
         
         for i, row in enumerate(data):
-            comp_name = comp_map.get(row.get("company_id"), "Unknown")
-            dept_name = dept_map.get(row.get("department_id"), "Unknown")
+            comp_name = comp_map.get(row.get("company_code"), "Unknown")
+            dept_name = dept_map.get(row.get("department_code"), "Unknown")
             
             item_no = QTableWidgetItem(str(row.get("emp_no", "")))
             item_no.setData(Qt.UserRole, i) # Original index in self.results
@@ -903,6 +987,7 @@ class EmployeeSearchDialog(QDialog):
             self.table.setItem(i, 1, QTableWidgetItem(str(row.get("name", ""))))
             self.table.setItem(i, 2, QTableWidgetItem(dept_name))
             self.table.setItem(i, 3, QTableWidgetItem(comp_name))
+            self.table.setItem(i, 4, QTableWidgetItem(str(row.get("rf_card_uid") or row.get("card_uid") or "")))
             
     def on_select(self):
         selected = self.table.selectedItems()
@@ -1292,7 +1377,7 @@ class CompanyScreen(QWidget):
             code = row.get("code", "")
             name = row.get("name", "")
             item_code = QTableWidgetItem(str(code))
-            item_code.setData(Qt.UserRole, row.get("id"))
+            item_code.setData(Qt.UserRole, row.get("code"))
             self.table.setItem(i, 0, item_code)
             self.table.setItem(i, 1, QTableWidgetItem(str(name)))
         self.table.setUpdatesEnabled(True)
@@ -1342,7 +1427,7 @@ class CompanyScreen(QWidget):
                 item0 = self.table.item(row, 0)
                 if item0 is not None:
                     self.table.setItem(row, 0, QTableWidgetItem(data.get("code", "")))
-                    self.table.item(row, 0).setData(Qt.UserRole, data.get("id"))
+                    self.table.item(row, 0).setData(Qt.UserRole, data.get("code"))
                 self.table.setItem(row, 1, QTableWidgetItem(str(data.get("name", ""))))
             self.main_win.on_company_changed()
             QMessageBox.information(self, "성공", "수정되었습니다.")
@@ -1429,7 +1514,7 @@ class CompanyScreen(QWidget):
                 item0 = self.table.item(i, 0)
                 if item0 is not None and item0.data(Qt.UserRole) is None:
                     item0.setText(str(data.get("code") or ""))
-                    item0.setData(Qt.UserRole, data.get("id"))
+                    item0.setData(Qt.UserRole, data.get("code"))
                     break
             self.main_win.on_company_changed()
             QMessageBox.information(self, "성공", "등록되었습니다.")
@@ -1524,24 +1609,31 @@ class DepartmentScreen(QWidget):
 
     def load_data(self):
         dept_list = [d for d in self.main_win.departments_data if isinstance(d, dict)]
-        dept_list.sort(key=lambda x: (int(x.get("company_id") or 0), int(x.get("id") or 0)))
+        dept_list.sort(key=lambda x: (str(x.get("company_code") or ""), str(x.get("code") or "")))
         self.display_data(dept_list)
 
     def display_data(self, data):
-        QApplication.restoreOverrideCursor()
-        if not isinstance(data, list): return
+        if not isinstance(data, list):
+            return
+        if getattr(self, "_filling_table", False):
+            return
+        self._filling_table = True
         self.table.setSortingEnabled(False)
         self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(data))
 
         for i, row in enumerate(data):
-            if not isinstance(row, dict): continue
+            if not isinstance(row, dict):
+                continue
             item_code = QTableWidgetItem(str(row.get("code") or ""))
-            item_code.setData(Qt.UserRole, row.get("id"))
+            item_code.setData(Qt.UserRole, row.get("code"))
             self.table.setItem(i, 0, item_code)
             self.table.setItem(i, 1, QTableWidgetItem(str(row.get("name") or "")))
+        self.table.blockSignals(False)
         self.table.setUpdatesEnabled(True)
         self.table.setSortingEnabled(True)
+        self._filling_table = False
 
     def on_edit(self):
         selected = self.table.selectedItems()
@@ -1573,8 +1665,14 @@ class DepartmentScreen(QWidget):
         if data:
             self.main_win.statusBar().showMessage("수정되었습니다.", 3000)
             # Update local cache in main window
+            old_code = None
+            selected = self.table.selectedItems()
+            if selected:
+                item0 = self.table.item(selected[0].row(), 0)
+                if item0 is not None:
+                    old_code = item0.data(Qt.UserRole)
             for i, d in enumerate(self.main_win.departments_data):
-                if d["id"] == data["id"]:
+                if isinstance(d, dict) and d.get("code") == old_code:
                     self.main_win.departments_data[i] = data
                     break
             
@@ -1622,7 +1720,7 @@ class DepartmentScreen(QWidget):
             if selected:
                 row = selected[0].row()
                 target_did = self.table.item(row, 0).data(Qt.UserRole)
-                self.main_win.departments_data = [d for d in self.main_win.departments_data if d["id"] != target_did]
+                self.main_win.departments_data = [d for d in self.main_win.departments_data if d.get("code") != target_did]
                 self.table.removeRow(row)
             self.main_win.employees.update_dept_combo()
             self.main_win.reports._refresh_dept_sub_combo()
@@ -1635,7 +1733,7 @@ class DepartmentScreen(QWidget):
 
     def on_add(self):
         companies = getattr(self.main_win, "companies_data", []) or []
-        cid = companies[0]["id"] if companies and isinstance(companies[0], dict) else None
+        cid = companies[0].get("code") if companies and isinstance(companies[0], dict) else None
         name = self.name_input.text().strip()
         if not cid or not name:
             QMessageBox.warning(self, "경고", "부서명을 입력하세요.")
@@ -1726,10 +1824,14 @@ class EmployeeScreen(QWidget):
         self.add_btn.setMinimumHeight(40)
         self.add_btn.clicked.connect(self.on_add)
 
-        self.edit_btn = QPushButton("수정")
+        self.edit_btn = CaptionPushButton("수정", "(단말기정보전송)")
         self.edit_btn.setObjectName("SecondaryBtn")
-        self.edit_btn.setMinimumHeight(40)
+        self.edit_btn.setMinimumHeight(64)
         self.edit_btn.setEnabled(False)
+        self.edit_btn.setToolTip(
+            "카드나 지문이 있으면 저장 후 설정에 등록된 단말 전체에 다시 전송합니다. "
+            "네트워크 오류로 DB에만 저장됐을 때 이 버튼으로 단말에 보냅니다."
+        )
         self.edit_btn.clicked.connect(self.on_edit)
 
         self.del_btn = QPushButton("삭제(퇴사)")
@@ -1767,6 +1869,12 @@ class EmployeeScreen(QWidget):
         self.import_btn.setMinimumHeight(40)
         self.import_btn.clicked.connect(self.on_import_excel)
 
+        self.export_btn = QPushButton("엑셀 내보내기")
+        self.export_btn.setObjectName("SecondaryBtn")
+        self.export_btn.setMinimumHeight(40)
+        self.export_btn.setToolTip("화면에 보이는 사원 목록을 엑셀 파일로 저장합니다.")
+        self.export_btn.clicked.connect(self.on_export_excel)
+
         # 좌측: 좁은 테이블 / 우측: 입력·버튼 전용 프레임
         main_row = QHBoxLayout()
         main_row.setSpacing(20)
@@ -1781,14 +1889,21 @@ class EmployeeScreen(QWidget):
         setup_standard_table(self.table)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)
         hdr.setSectionResizeMode(3, QHeaderView.Fixed)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        self.table.setColumnWidth(0, 48)
-        self.table.setColumnWidth(3, 72)
+        hdr.setSectionResizeMode(4, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(5, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 72)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 120)
+        self.table.setColumnWidth(3, 160)
+        self.table.setColumnWidth(4, 160)
+        self.table.setColumnWidth(5, 110)
+        self.table.setColumnWidth(6, 72)
+        self._applying_col_widths = False
+        self.table.installEventFilter(self)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
         table_v.addWidget(self.table)
@@ -1855,13 +1970,84 @@ class EmployeeScreen(QWidget):
         reg_outer.addLayout(row_rest)
 
         reg_outer.addSpacing(12)
-        reg_outer.addWidget(self.import_btn)
+        self.replace_employees_check = QCheckBox("기존 데이터 삭제후 등록 (미체크시 추가등록)")
+        self.replace_employees_check.setStyleSheet(
+            "QCheckBox { color: #e2e8f0; font-size: 13px; font-weight: bold; font-family: 'Malgun Gothic'; }"
+            "QCheckBox::indicator { width: 18px; height: 18px; }"
+        )
+        self.replace_employees_check.setToolTip(
+            "체크하면 이 회사 사원·지문·식사 기록을 지운 뒤 엑셀만 등록합니다. "
+            "체크하지 않으면 없는 사번만 추가 등록합니다."
+        )
+        reg_outer.addWidget(self.replace_employees_check)
+        row_excel = QHBoxLayout()
+        row_excel.setSpacing(10)
+        row_excel.addWidget(self.import_btn, 1)
+        row_excel.addWidget(self.export_btn, 1)
+        reg_outer.addLayout(row_excel)
         main_row.addWidget(reg_frame, 0)
 
         layout.addLayout(main_row, 1)
 
-        # Connections
-        self.search_input.textChanged.connect(self.load_data)
+        # Connections — 글자마다 1000명을 다시 읽지 않도록 잠깐 모아서 조회
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.load_data)
+        self.search_input.textChanged.connect(self._on_employee_search_changed)
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "table", None) and event.type() == QEvent.Resize:
+            self._apply_employee_column_widths(event.size().width())
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._apply_employee_column_widths)
+
+    def _employee_table_inner_width(self, widget_width=None) -> int:
+        table = self.table
+        if widget_width is None:
+            widget_width = table.width()
+        frame = table.frameWidth() * 2
+        sb = table.verticalScrollBar()
+        sb_w = sb.width() if sb is not None and sb.isVisible() else 0
+        return max(0, int(widget_width) - frame - sb_w)
+
+    def _apply_employee_column_widths(self, widget_width=None):
+        """RF카드 UID는 남는 폭의 절반만 쓰고, 줄인 폭은 No·이름·부서에 균등 분배."""
+        if getattr(self, "_applying_col_widths", False):
+            return
+        table = self.table
+        vp = self._employee_table_inner_width(widget_width)
+        if vp <= 0:
+            return
+        keep = 150 + 110 + 72
+        base_no, base_name, base_dept = 72, 120, 160
+        rf_now = vp - keep - (base_no + base_name + base_dept)
+        if rf_now < 2:
+            return
+        freed = rf_now // 2
+        rf_w = rf_now - freed
+        share, rem = divmod(freed, 3)
+        self._applying_col_widths = True
+        try:
+            hdr = table.horizontalHeader()
+            hdr.setStretchLastSection(False)
+            for col in range(7):
+                hdr.setSectionResizeMode(col, QHeaderView.Fixed)
+            table.setColumnWidth(0, base_no + share + (1 if rem > 0 else 0))
+            table.setColumnWidth(1, 150)
+            table.setColumnWidth(2, base_name + share + (1 if rem > 1 else 0))
+            table.setColumnWidth(3, base_dept + share)
+            table.setColumnWidth(4, rf_w)
+            table.setColumnWidth(5, 110)
+            table.setColumnWidth(6, 72)
+        finally:
+            self._applying_col_widths = False
+
+    def _on_employee_search_changed(self, _text: str):
+        self._search_timer.start()
 
     def _employee_id_for_row_actions(self):
         """표 선택이 버튼으로 포커스가 옮겨가며 selectedItems()가 비는 경우에도 id 복구."""
@@ -1900,10 +2086,10 @@ class EmployeeScreen(QWidget):
         self.dept_combo.clear()
         self.dept_combo.addItem("** 선택 **", None)
         depts = [d for d in self.main_win.departments_data if isinstance(d, dict)]
-        depts.sort(key=lambda x: (int(x.get("company_id") or 0), int(x.get("id") or 0)))
+        depts.sort(key=lambda x: (str(x.get("company_code") or ""), str(x.get("code") or "")))
         for d in depts:
             label = str(d.get("name") or "").strip() or "(이름 없음)"
-            self.dept_combo.addItem(label, d.get("id"))
+            self.dept_combo.addItem(label, d.get("code"))
 
     def on_selection_changed(self):
         self._selected_emp_id = None
@@ -1968,11 +2154,11 @@ class EmployeeScreen(QWidget):
         cid = None
         if did is not None:
             for d in self.main_win.departments_data or []:
-                if isinstance(d, dict) and d.get("id") == did:
-                    cid = d.get("company_id")
+                if isinstance(d, dict) and d.get("code") == did:
+                    cid = d.get("company_code")
                     break
         if cid is None and companies and isinstance(companies[0], dict):
-            cid = companies[0].get("id")
+            cid = companies[0].get("code")
         emp_no = self.emp_no_input.text().strip()
         name = self.name_input.text().strip()
 
@@ -1981,8 +2167,8 @@ class EmployeeScreen(QWidget):
             return
 
         payload = {
-            "company_id": cid,
-            "department_id": did,
+            "company_code": cid,
+            "department_code": did,
             "emp_no": emp_no,
             "name": name,
             "status": "ACTIVE",
@@ -2011,18 +2197,18 @@ class EmployeeScreen(QWidget):
         cid = None
         if did is not None:
             for d in self.main_win.departments_data or []:
-                if isinstance(d, dict) and d.get("id") == did:
-                    cid = d.get("company_id")
+                if isinstance(d, dict) and d.get("code") == did:
+                    cid = d.get("company_code")
                     break
         companies = getattr(self.main_win, "companies_data", []) or []
         if cid is None and companies and isinstance(companies[0], dict):
-            cid = companies[0].get("id")
+            cid = companies[0].get("code")
         emp_no = self.emp_no_input.text().strip()
         name = self.name_input.text().strip()
 
         payload = {
-            "company_id": cid,
-            "department_id": did,
+            "company_code": cid,
+            "department_code": did,
             "emp_no": emp_no,
             "name": name,
             "rf_card_uid": self.rf_card_uid_input.text().strip() or None,
@@ -2036,9 +2222,70 @@ class EmployeeScreen(QWidget):
         self._emp_mutate_loader.error.connect(self.on_action_error)
         self._emp_mutate_loader.start()
 
+    def on_export_excel(self):
+        """화면에 보이는 사원 테이블을 엑셀로 저장한 뒤 연다."""
+        import os
+        import subprocess
+        import sys
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, Alignment
+        except ImportError:
+            QMessageBox.warning(self, "오류", "엑셀 저장을 위해 openpyxl이 필요합니다.\npip install openpyxl")
+            return
+        if self.table.rowCount() <= 0:
+            QMessageBox.information(self, "엑셀 내보내기", "내보낼 사원이 없습니다.")
+            return
+        from PyQt5.QtWidgets import QFileDialog
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "사원 목록 저장", "사원목록.xlsx", "Excel Files (*.xlsx)"
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".xlsx"):
+            file_path += ".xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "사원목록"
+        col_count = self.table.columnCount()
+        if col_count > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=col_count)
+        ws.cell(row=1, column=1, value="사원 목록").font = Font(bold=True, size=16)
+        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 28
+        for c in range(col_count):
+            h = self.table.horizontalHeaderItem(c)
+            ws.cell(row=2, column=c + 1, value=h.text() if h else "").font = Font(bold=True)
+        for r in range(self.table.rowCount()):
+            for c in range(col_count):
+                item = self.table.item(r, c)
+                val = item.text() if item else ""
+                ws.cell(row=r + 3, column=c + 1, value=val)
+        widths = (8, 16, 14, 18, 22, 14, 10)
+        for i in range(1, col_count + 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = (
+                widths[i - 1] if i - 1 < len(widths) else 14
+            )
+        try:
+            wb.save(file_path)
+        except Exception as e:
+            QMessageBox.warning(self, "오류", "엑셀 파일 저장 실패:\n%s" % e)
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(file_path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", file_path], check=True)
+            else:
+                subprocess.run(["xdg-open", file_path], check=True)
+        except Exception:
+            pass
+
     def on_import_excel(self):
         companies = getattr(self.main_win, "companies_data", []) or []
-        cid = companies[0]["id"] if companies and isinstance(companies[0], dict) else None
+        cid = companies[0].get("code") if companies and isinstance(companies[0], dict) else None
         if not cid:
             QMessageBox.warning(self, "경고", "회사 데이터가 없습니다.")
             return
@@ -2046,21 +2293,45 @@ class EmployeeScreen(QWidget):
         from PyQt5.QtWidgets import QFileDialog
         file_path, _ = QFileDialog.getOpenFileName(self, "사원 엑셀 파일 선택", "", "Excel Files (*.xlsx *.xls)")
         if not file_path: return
+
+        replace = self.replace_employees_check.isChecked()
+        if replace:
+            if QMessageBox.question(
+                self,
+                "확인",
+                "기존 사원을 모두 삭제한 뒤 엑셀 내용으로 다시 등록합니다.\n"
+                "지문과 식사 기록도 함께 삭제됩니다.\n"
+                "계속하시겠습니까?",
+            ) != QMessageBox.Yes:
+                return
         
         try:
             with open(file_path, "rb") as f:
                 file_content = f.read()
             
             self.import_btn.setEnabled(False)
-            self.main_win.statusBar().showMessage("엑셀 데이터 업로드 중...", 5000)
-            self.import_loader = DataLoader(self.api.import_employees_excel, cid, file_content)
+            self.replace_employees_check.setEnabled(False)
+            self.main_win.statusBar().showMessage(
+                "기존 사원 삭제 후 엑셀 등록 중..." if replace else "엑셀 데이터 추가 등록 중...",
+                5000,
+            )
+            self.import_loader = DataLoader(self.api.import_employees_excel, cid, file_content, replace)
             self.import_loader.finished.connect(self.on_import_finished)
+            self.import_loader.error.connect(self._on_import_error)
             self.import_loader.start()
         except Exception as e:
+            self.import_btn.setEnabled(True)
+            self.replace_employees_check.setEnabled(True)
             QMessageBox.critical(self, "오류", f" 파일을 읽을 수 없습니다: {str(e)}")
+
+    def _on_import_error(self, err_msg):
+        self.import_btn.setEnabled(True)
+        self.replace_employees_check.setEnabled(True)
+        QMessageBox.critical(self, "처리 오류", "엑셀 등록 중 오류가 발생했습니다:\n%s" % err_msg)
 
     def on_import_finished(self, result):
         self.import_btn.setEnabled(True)
+        self.replace_employees_check.setEnabled(True)
         success, data = result if isinstance(result, tuple) else (False, result)
         if success:
             msg = data.get("message", "완료되었습니다.")
@@ -2172,20 +2443,31 @@ class EmployeeScreen(QWidget):
         if success:
             self.clear_inputs()
             self.load_data()
-            msg = "삭제되었습니다."
-            if f22_rep:
-                lines = []
-                for ip, ok, m in f22_rep:
-                    st = "OK" if ok else "실패"
-                    lines.append("%s: %s — %s" % (ip, st, m))
-                msg += "\n\n[F22 단말]\n" + "\n".join(lines)
-                any_fail = any(not x[1] for x in f22_rep)
-                if any_fail:
-                    QMessageBox.warning(self, "삭제 완료", msg)
-                else:
-                    QMessageBox.information(self, "삭제 완료", msg)
+            fails, oks = _f22_sync_result_lines(self.api, f22_rep)
+            if not fails and not oks:
+                QMessageBox.information(self, "성공", "삭제되었습니다.")
+                return
+            lines = []
+            if fails:
+                lines.append("DB에서는 삭제되었습니다. 아래 단말에는 반영되지 않았습니다.")
+                lines.append("실패 %d대 · 성공 %d대" % (len(fails), len(oks)))
+                lines.append("")
+                lines.append("동기화되지 않은 단말")
+                for name, msg in fails:
+                    lines.append("· %s" % name)
+                    if msg:
+                        lines.append("  %s" % msg)
+                if oks:
+                    lines.append("")
+                    lines.append("반영된 단말")
+                    for name, _msg in oks:
+                        lines.append("· %s" % name)
+                dark_warning(self, "삭제 완료", "\n".join(lines))
             else:
-                QMessageBox.information(self, "성공", msg)
+                lines.append("삭제되었습니다. 단말 %d대에 반영됨" % len(oks))
+                for name, _msg in oks:
+                    lines.append("· %s" % name)
+                dark_information(self, "삭제 완료", "\n".join(lines))
         else:
             QMessageBox.warning(self, "오류", "삭제에 실패했습니다.")
 
@@ -2238,7 +2520,7 @@ class EmployeeScreen(QWidget):
 
         row_data = None
         for r in getattr(self, "_employees_list", []) or []:
-            if isinstance(r, dict) and r.get("id") == eid:
+            if isinstance(r, dict) and str(r.get("emp_no") or "") == str(eid):
                 row_data = r
                 break
 
@@ -2249,20 +2531,20 @@ class EmployeeScreen(QWidget):
         cid = None
         if did is not None:
             for d in self.main_win.departments_data or []:
-                if isinstance(d, dict) and d.get("id") == did:
-                    cid = d.get("company_id")
+                if isinstance(d, dict) and d.get("code") == did:
+                    cid = d.get("company_code")
                     break
         if row_data:
             emp_no = emp_no or str(row_data.get("emp_no") or "").strip()
             name = name or str(row_data.get("name") or "").strip()
             rf_card = rf_card or str(row_data.get("rf_card_uid") or "").strip()
             if cid is None:
-                cid = row_data.get("company_id")
+                cid = row_data.get("company_code")
             if did is None:
-                did = row_data.get("department_id")
+                did = row_data.get("department_code")
         companies = getattr(self.main_win, "companies_data", []) or []
         if cid is None and companies and isinstance(companies[0], dict):
-            cid = companies[0].get("id")
+            cid = companies[0].get("code")
 
         if not emp_no:
             QMessageBox.warning(self, "지문", "사번을 확인할 수 없습니다.")
@@ -2386,17 +2668,51 @@ class EmployeeScreen(QWidget):
         QMessageBox.critical(self, "처리 오류", f"작업 중 오류가 발생했습니다:\n{err_msg}")
 
     def load_data(self):
-        # 재직+퇴사 모두 조회 (status 없음 = 전체)
-        self.loader = DataLoader(self.api.get_employees, self.search_input.text(), None)
-        self.loader.finished.connect(self.display_data)
-        self.loader.error.connect(self._on_employee_list_error)
-        self.loader.start()
+        # 재직+퇴사 모두 조회 (status 없음 = 전체).
+        # 탭을 오가는 동안 이전 조회 스레드를 지우면 창이 멈춘다.
+        if getattr(self, "_employee_load_running", False):
+            self._employee_reload_pending = True
+            return
+        self._employee_reload_pending = False
+        self._employee_load_running = True
+        loader = DataLoader(self.api.get_employees, self.search_input.text(), None)
+        loader.finished.connect(self._on_employee_load_finished)
+        loader.error.connect(self._on_employee_list_error)
+        self.loader = loader
+        loader.start()
+
+    def _schedule_pending_employee_load(self):
+        if not getattr(self, "_employee_reload_pending", False):
+            return
+        self._employee_reload_pending = False
+        QTimer.singleShot(0, self.load_data)
+
+    def _on_employee_load_finished(self, data):
+        self._employee_load_running = False
+        sender = self.sender()
+        try:
+            self.display_data(data)
+        finally:
+            if sender is not None:
+                sender.deleteLater()
+            self._schedule_pending_employee_load()
 
     def _on_employee_list_error(self, err_msg: str):
+        self._employee_load_running = False
+        sender = self.sender()
+        if sender is not None:
+            sender.deleteLater()
         QMessageBox.warning(self, "사원 목록", "불러오기 실패:\n%s" % err_msg)
+        self._schedule_pending_employee_load()
 
     def display_data(self, data):
         if not isinstance(data, list): return
+        if getattr(self, "_filling_table", False):
+            return
+        self._filling_table = True
+        self.table.setSortingEnabled(False)
+        self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
         self._employees_list = list(data)
 
         selected_ids = set()
@@ -2406,15 +2722,9 @@ class EmployeeScreen(QWidget):
 
         self._selected_emp_id = None
 
-        self.table.setSortingEnabled(False)
-        self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(data))
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["No", "사번", "이름", "부서", "RF카드 UID", "지문", "상태"])
-        self.table.setColumnWidth(0, 48)
-        self.table.setColumnWidth(3, 72)
 
-        dept_map = {d["id"]: d["name"] for d in self.main_win.departments_data if isinstance(d, dict)}
+        dept_map = {d["code"]: d["name"] for d in self.main_win.departments_data if isinstance(d, dict)}
 
         for i, row in enumerate(data):
             if not isinstance(row, dict): continue
@@ -2423,16 +2733,16 @@ class EmployeeScreen(QWidget):
             item_idx.setTextAlignment(Qt.AlignCenter)
 
             item_emp = QTableWidgetItem(str(row.get("emp_no", "")))
-            row_id = row.get("id")
+            row_id = str(row.get("emp_no") or "")
             item_emp.setData(Qt.UserRole, row_id)
 
-            dept_name = dept_map.get(row.get("department_id"), "Unknown")
+            dept_name = dept_map.get(row.get("department_code"), "Unknown")
             status_label = "재직" if _employee_status_is_active(row.get("status")) else "퇴사"
             rf_uid = str(row.get("rf_card_uid") or row.get("card_uid") or "")
             item_fp = QTableWidgetItem(_employee_fp_cell_text(row))
 
             item_dept = QTableWidgetItem(dept_name)
-            item_dept.setData(Qt.UserRole, row.get("department_id"))
+            item_dept.setData(Qt.UserRole, row.get("department_code"))
 
             self.table.setItem(i, 0, item_idx)
             self.table.setItem(i, 1, item_emp)
@@ -2455,19 +2765,16 @@ class EmployeeScreen(QWidget):
                     if it: it.setSelected(True)
                 self._selected_emp_id = row_id
 
-        hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(3, QHeaderView.Fixed)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        self.table.setColumnWidth(0, 48)
-        self.table.setColumnWidth(3, 72)
-
+        self.table.blockSignals(False)
         self.table.setUpdatesEnabled(True)
+        header = self.table.horizontalHeader()
+        header.blockSignals(True)
         self.table.setSortingEnabled(True)
+        header.blockSignals(False)
+        self._filling_table = False
+        QTimer.singleShot(0, self._apply_employee_column_widths)
+        if selected_ids:
+            self.on_selection_changed()
 
 
 def _meal_raw_data_status_label(row: dict) -> str:
@@ -2479,7 +2786,89 @@ def _meal_raw_data_status_label(row: dict) -> str:
     p = str(row.get("path") or "").strip().lower()
     if p == "manual":
         return "수기"
-    return "단말"
+        return "단말"
+
+
+class FailCardEmployeeDialog(QDialog):
+    """인증실패 카드번호로 찾은 사원 정보."""
+
+    def __init__(self, card_no: str, rows: list, parent=None, fail_when=None):
+        super().__init__(parent)
+        self._rows = list(rows or [])
+        self._fail_when = fail_when or ("", "")
+        self.setWindowTitle("인사 정보")
+        self.setObjectName("FailCardEmployeeDialog")
+        self.setMinimumWidth(420)
+        self.setStyleSheet(
+            """
+            #FailCardEmployeeDialog { background-color: #1e293b; }
+            #FailCardEmployeeDialog QLabel { color: #e2e8f0; font-size: 16px; font-family: 'Malgun Gothic'; }
+            #FailCardEmployeeDialog QLabel#InputLabel { color: #94a3b8; font-weight: bold; font-size: 15px; }
+            #FailCardEmployeeDialog QLabel#ValueLabel { color: #f8fafc; font-weight: bold; font-size: 18px; }
+            """
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(12)
+        title = QLabel("카드번호  %s" % (card_no or ""))
+        title.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: bold; font-family: 'Malgun Gothic';")
+        lay.addWidget(title)
+        when_date, when_time = self._fail_when
+        if when_date or when_time:
+            when = QLabel("인증시각  %s %s" % (when_date, when_time))
+            when.setStyleSheet("color: #94a3b8; font-size: 14px; font-family: 'Malgun Gothic';")
+            lay.addWidget(when)
+        self._reg_buttons = []
+        if not self._rows:
+            empty = QLabel("해당 카드번호의 사원이 없습니다.")
+            empty.setWordWrap(True)
+            lay.addWidget(empty)
+        else:
+            for i, row in enumerate(self._rows):
+                if i:
+                    line = QFrame()
+                    line.setFrameShape(QFrame.HLine)
+                    line.setStyleSheet("color: #334155;")
+                    lay.addWidget(line)
+                form = QFormLayout()
+                form.setHorizontalSpacing(16)
+                form.setVerticalSpacing(8)
+                for lab, val in (
+                    ("사번", row.get("emp_no") or ""),
+                    ("성명", row.get("name") or ""),
+                    ("부서", row.get("dept_name") or ""),
+                    ("UID", row.get("rf_card_uid") or ""),
+                ):
+                    name = QLabel(lab)
+                    name.setObjectName("InputLabel")
+                    value = QLabel(str(val))
+                    value.setObjectName("ValueLabel")
+                    value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    form.addRow(name, value)
+                lay.addLayout(form)
+                reg_btn = QPushButton("원시데이터 등록")
+                reg_btn.setObjectName("PrimaryBtn")
+                reg_btn.setFixedHeight(40)
+                reg_btn.clicked.connect(lambda _checked=False, emp=row: self._on_register(emp))
+                self._reg_buttons.append(reg_btn)
+                lay.addWidget(reg_btn)
+        close_btn = QPushButton("닫기")
+        close_btn.setObjectName("SecondaryBtn")
+        close_btn.setFixedHeight(40)
+        close_btn.clicked.connect(self.accept)
+        lay.addWidget(close_btn)
+
+    def _on_register(self, emp: dict):
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "register_meal_from_fail_card"):
+            return
+        for btn in self._reg_buttons:
+            btn.setEnabled(False)
+        parent.register_meal_from_fail_card(emp, self._fail_when, self)
+
+    def set_register_enabled(self, enabled: bool):
+        for btn in self._reg_buttons:
+            btn.setEnabled(enabled)
 
 
 class RawDataRecordAddDialog(QDialog):
@@ -2597,9 +2986,7 @@ class RawDataRecordAddDialog(QDialog):
 
     def _apply_edit_log(self, log: dict):
         u = log.get("user") or {}
-        uid = log.get("user_id")
-        if uid is None:
-            uid = u.get("id")
+        uid = str((log.get("user") or {}).get("emp_no") or log.get("emp_no") or "").strip() or None
         self.selected_user_id = uid
         name = str(u.get("name") or "")
         emp_no = str(u.get("emp_no") or "")
@@ -2626,7 +3013,7 @@ class RawDataRecordAddDialog(QDialog):
         if dialog.exec_():
             emp = dialog.selected_employee
             if emp:
-                self.selected_user_id = emp["id"]
+                self.selected_user_id = emp.get("emp_no")
                 self.emp_search_input.setText(str(emp.get("name") or ""))
                 self.selected_emp_label.setText(
                     "선택됨: %s (%s)"
@@ -2653,7 +3040,7 @@ class RawDataRecordAddDialog(QDialog):
             except (TypeError, ValueError):
                 guest = 0
         return {
-            "user_id": self.selected_user_id,
+            "emp_no": self.selected_user_id,
             "policy_id": policy_id,
             "created_at": dt_str,
             "guest_count": guest,
@@ -2746,7 +3133,32 @@ class RawDataScreen(QWidget):
         self.fail_table.setFixedHeight(_fail_hdr_h + _fail_row_h * 5 + 2)
         self.fail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.fail_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_layout.addWidget(self.fail_table, 0)
+        self.fail_table.itemSelectionChanged.connect(self._on_fail_table_selection_changed)
+        fail_row = QHBoxLayout()
+        fail_row.setSpacing(10)
+        fail_row.addWidget(self.fail_table, 1)
+        self.fail_card_input = QLineEdit()
+        self.fail_card_input.setPlaceholderText("카드번호")
+        self.fail_card_input.setFixedWidth(170)
+        self.fail_card_input.setMinimumHeight(40)
+        self.fail_card_input.returnPressed.connect(self.on_lookup_fail_card)
+        self.fail_card_lookup_btn = QPushButton("조회")
+        self.fail_card_lookup_btn.setObjectName("SecondaryBtn")
+        self.fail_card_lookup_btn.setFixedWidth(72)
+        self.fail_card_lookup_btn.setMinimumHeight(40)
+        self.fail_card_lookup_btn.clicked.connect(self.on_lookup_fail_card)
+        card_side = QHBoxLayout()
+        card_side.setSpacing(8)
+        card_side.addWidget(self.fail_card_input)
+        card_side.addWidget(self.fail_card_lookup_btn)
+        card_wrap = QWidget()
+        card_outer = QVBoxLayout(card_wrap)
+        card_outer.setContentsMargins(0, 0, 0, 0)
+        card_outer.addStretch(1)
+        card_outer.addLayout(card_side)
+        card_outer.addStretch(1)
+        fail_row.addWidget(card_wrap, 0)
+        left_layout.addLayout(fail_row, 0)
 
         main_h_layout.addLayout(left_layout, 7) # 70% width
         
@@ -2792,10 +3204,34 @@ class RawDataScreen(QWidget):
 
         main_h_layout.addWidget(self.input_panel)
         self.current_log_id = None
+        self.full_data = []
+        self._query_gen = 0
+        self._exclusive_selecting = False
+
+    def reset_view(self):
+        """다른 탭으로 나가면 조회 결과와 검색 조건을 처음 상태로 되돌린다."""
+        self._query_gen = getattr(self, "_query_gen", 0) + 1
+        self.full_data = []
+        self.search_input.clear()
+        today = QDate.currentDate()
+        self.start_date_edit.setDate(today)
+        self.end_date_edit.setDate(today)
+        for table in (self.table, self.fail_table):
+            header = table.horizontalHeader()
+            header.blockSignals(True)
+            table.setSortingEnabled(False)
+            table.setRowCount(0)
+            table.setSortingEnabled(True)
+            header.blockSignals(False)
+        self.fail_card_input.clear()
+        self.clear_inputs()
+
     def load_data(self):
         start_date = self.start_date_edit.date().toString("yyyy-MM-dd")
         end_date = self.end_date_edit.date().toString("yyyy-MM-dd")
         search = self.search_input.text()
+        self._query_gen = getattr(self, "_query_gen", 0) + 1
+        query_gen = self._query_gen
 
         def _bundle():
             ok1, meal = self.api.get_raw_data(search, start_date, end_date)
@@ -2807,10 +3243,12 @@ class RawDataScreen(QWidget):
             return True, {"meal": meal, "failures": fails}
 
         self.loader = DataLoader(_bundle)
-        self.loader.finished.connect(self.display_bundle)
+        self.loader.finished.connect(lambda result, g=query_gen: self.display_bundle(result, g))
         self.loader.start()
 
-    def display_bundle(self, result):
+    def display_bundle(self, result, query_gen=None):
+        if query_gen is not None and query_gen != getattr(self, "_query_gen", None):
+            return
         if isinstance(result, tuple) and len(result) >= 2:
             success, payload = result[0], result[1]
             if not success:
@@ -2836,6 +3274,7 @@ class RawDataScreen(QWidget):
             time_part = created_at.split("T")[-1][:8]
             item_no = QTableWidgetItem()
             item_no.setData(Qt.DisplayRole, i + 1)
+            item_no.setData(Qt.UserRole, row.get("id"))
             self.fail_table.setItem(i, 0, item_no)
             self.fail_table.setItem(i, 1, QTableWidgetItem(date_part))
             self.fail_table.setItem(i, 2, QTableWidgetItem(time_part))
@@ -2940,7 +3379,174 @@ class RawDataScreen(QWidget):
             print(f"Error judging meal type: {e}")
             return "번외"
 
+    def _drop_other_row_selection(self, source, other):
+        """한쪽 표를 고르면 다른 쪽 선택 표시를 되돌린다."""
+        if self._exclusive_selecting:
+            return
+        sm = source.selectionModel()
+        if sm is None or not sm.hasSelection():
+            return
+        self._exclusive_selecting = True
+        try:
+            other.clearSelection()
+            other.setCurrentItem(None)
+        finally:
+            self._exclusive_selecting = False
+
+    def _on_fail_table_selection_changed(self):
+        self._drop_other_row_selection(self.fail_table, self.table)
+        selected = self.fail_table.selectedItems()
+        if not selected:
+            return
+        card_item = self.fail_table.item(selected[0].row(), 3)
+        card = (card_item.text() if card_item else "").strip()
+        if card == "-":
+            card = ""
+        self.fail_card_input.setText(card)
+
+    def _selected_fail_log_id(self):
+        selected = self.fail_table.selectedItems()
+        if not selected:
+            return None
+        item = self.fail_table.item(selected[0].row(), 0)
+        if item is None:
+            return None
+        return item.data(Qt.UserRole)
+
+    def _selected_fail_when(self):
+        selected = self.fail_table.selectedItems()
+        if not selected:
+            return "", ""
+        row = selected[0].row()
+        date_item = self.fail_table.item(row, 1)
+        time_item = self.fail_table.item(row, 2)
+        return (
+            (date_item.text() if date_item else "").strip(),
+            (time_item.text() if time_item else "").strip(),
+        )
+
+    def _policy_id_for_clock(self, time_str: str):
+        meal = self.get_meal_type_by_time(time_str)
+        if not meal or meal == "번외":
+            return None, meal or "번외"
+        for p in self.policies_list or []:
+            if str(p.get("meal_type") or "") == meal:
+                return p.get("id"), meal
+        return None, meal
+
+    def register_meal_from_fail_card(self, emp: dict, fail_when, dialog):
+        """인증실패 시각과 조회된 사원으로 원시데이터(수기)를 등록한다."""
+        date_s, time_s = fail_when or ("", "")
+        ask = dialog if dialog is not None else self
+        if not date_s or not time_s:
+            dark_warning(
+                ask,
+                "원시데이터 등록",
+                "인증실패 줄의 날짜·시간이 없습니다.\n실패 목록에서 줄을 선택한 뒤 조회하세요.",
+            )
+            if dialog is not None:
+                dialog.set_register_enabled(True)
+            return
+        emp_no = str((emp or {}).get("emp_no") or "").strip()
+        name = str((emp or {}).get("name") or "").strip()
+        if not emp_no:
+            dark_warning(ask, "원시데이터 등록", "사번이 없습니다.")
+            if dialog is not None:
+                dialog.set_register_enabled(True)
+            return
+        if len(time_s) == 5:
+            time_s = time_s + ":00"
+        policy_id, meal = self._policy_id_for_clock(time_s)
+        if (
+            dark_question(
+                ask,
+                "원시데이터 등록",
+                "%s (%s)\n%s %s\n식사: %s\n\n원시데이터에 등록하고, 이 인증실패 기록은 삭제합니다. 계속할까요?"
+                % (name, emp_no, date_s, time_s, meal),
+            )
+            != QMessageBox.Ok
+        ):
+            if dialog is not None:
+                dialog.set_register_enabled(True)
+            return
+        payload = {
+            "emp_no": emp_no,
+            "policy_id": policy_id,
+            "created_at": "%sT%s" % (date_s, time_s),
+            "guest_count": 0,
+        }
+        fail_id = getattr(self, "_fail_lookup_log_id", None)
+
+        def _job():
+            ok, data = self.api.create_manual_raw_data(payload)
+            if not ok:
+                return False, data
+            if fail_id is None:
+                return True, data
+            deleted, detail = self.api.delete_auth_failure_log(fail_id)
+            if not deleted:
+                return True, "원시데이터는 등록됐지만 인증실패 기록 삭제에 실패했습니다.\n%s" % detail
+            return True, data
+
+        self._fail_reg_dialog = dialog
+        self._fail_reg_loader = DataLoader(_job)
+        self._fail_reg_loader.finished.connect(self._on_fail_card_register_done)
+        self._fail_reg_loader.error.connect(self._on_fail_card_register_err)
+        self._fail_reg_loader.start()
+
+    def _on_fail_card_register_done(self, result):
+        dialog = getattr(self, "_fail_reg_dialog", None)
+        ok, data = result if isinstance(result, tuple) else (False, result)
+        if not ok:
+            if dialog is not None:
+                dialog.set_register_enabled(True)
+            dark_warning(self, "원시데이터 등록", str(data))
+            return
+        if dialog is not None:
+            dialog.accept()
+        if isinstance(data, str) and data.strip():
+            dark_warning(self, "원시데이터 등록", data)
+        else:
+            dark_information(self, "원시데이터 등록", "원시데이터에 등록하고 인증실패 기록은 삭제했습니다.")
+        self.load_data()
+
+    def _on_fail_card_register_err(self, err_msg):
+        dialog = getattr(self, "_fail_reg_dialog", None)
+        if dialog is not None:
+            dialog.set_register_enabled(True)
+        dark_warning(self, "원시데이터 등록", str(err_msg))
+
+    def on_lookup_fail_card(self):
+        card = self.fail_card_input.text().strip()
+        if not card or card == "-":
+            QMessageBox.information(self, "카드 조회", "카드번호를 입력하세요.")
+            return
+        if getattr(self, "_card_lookup_loader", None) is not None and self._card_lookup_loader.isRunning():
+            return
+        self.fail_card_lookup_btn.setEnabled(False)
+        self._card_lookup_loader = DataLoader(self.api.find_employees_by_rf_card, card)
+        self._card_lookup_loader.finished.connect(self._on_fail_card_lookup_done)
+        self._card_lookup_loader.error.connect(self._on_fail_card_lookup_err)
+        self._card_lookup_loader.start()
+
+    def _on_fail_card_lookup_done(self, result):
+        self.fail_card_lookup_btn.setEnabled(True)
+        ok, data = result if isinstance(result, tuple) else (False, result)
+        if not ok:
+            QMessageBox.warning(self, "카드 조회", str(data))
+            return
+        rows = data if isinstance(data, list) else []
+        card = self.fail_card_input.text().strip()
+        self._fail_lookup_log_id = self._selected_fail_log_id()
+        FailCardEmployeeDialog(card, rows, self, self._selected_fail_when()).exec_()
+        self.fail_card_input.clear()
+
+    def _on_fail_card_lookup_err(self, err_msg):
+        self.fail_card_lookup_btn.setEnabled(True)
+        QMessageBox.warning(self, "카드 조회", str(err_msg))
+
     def on_selection_changed(self):
+        self._drop_other_row_selection(self.table, self.fail_table)
         selected = self.table.selectedItems()
         if not selected:
             self.current_log_id = None
@@ -3520,7 +4126,7 @@ class ReportScreen(QWidget):
                 n = d.get("name") or "미지정"
                 if n not in seen:
                     seen.add(n)
-                    self.dept_sub_combo.addItem(n, d.get("id"))
+                    self.dept_sub_combo.addItem(n, d.get("code"))
         self.dept_sub_combo.setCurrentIndex(0)
 
     def _on_dept_combo_changed(self):
@@ -3554,7 +4160,7 @@ class ReportScreen(QWidget):
         if not isinstance(u, dict):
             u = {}
         return (
-            u.get("id"),
+            str(u.get("emp_no") or u.get("empNo") or ""),
             str(u.get("name") or "미지정"),
             str(u.get("emp_no") or u.get("empNo") or ""),
         )
@@ -3737,8 +4343,11 @@ class ReportScreen(QWidget):
         self.table.clearSelection()
 
         if self.report_detail_employee:
-            emp_id = self.report_detail_employee.get("id")
-            data = [log for log in self.full_data if (log.get("user") or {}).get("id") == emp_id]
+            emp_no = str(self.report_detail_employee.get("emp_no") or "")
+            data = [
+                log for log in self.full_data
+                if str((log.get("user") or {}).get("emp_no") or log.get("emp_no") or "") == emp_no
+            ]
             by_emp = self._populate_detail_report_table(data, by_employee=False)
             self.table.setSortingEnabled(not by_emp)
             self.table.setUpdatesEnabled(True)
@@ -3748,19 +4357,13 @@ class ReportScreen(QWidget):
         if dept_id in (None, "INDIVIDUAL"):
             data = self.full_data
         else:
-            try:
-                dept_id_int = int(dept_id)
-            except (TypeError, ValueError):
-                dept_id_int = None
+            want = str(dept_id)
             data = []
             for log in self.full_data:
                 u = log.get("user") or {}
-                try:
-                    log_dept = u.get("department_id")
-                    if log_dept is not None and int(log_dept) == dept_id_int:
-                        data.append(log)
-                except (TypeError, ValueError):
-                    continue
+                log_dept = str((u or {}).get("department_code") or "")
+                if log_dept and log_dept == want:
+                    data.append(log)
 
         by_emp = self._populate_detail_report_table(data, by_employee=(dept_id == "INDIVIDUAL"))
         self.table.setSortingEnabled(not by_emp)
@@ -4153,6 +4756,9 @@ class SettingsScreen(QWidget):
         self.api = api
         self.main_win = main_win
         self._last_conn_rep = None
+        self._device_online = {}
+        self._aux_probe_loader = None
+        self._aux_probe_pending = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 10, 16, 12)
         layout.setSpacing(8)
@@ -4410,8 +5016,8 @@ class SettingsScreen(QWidget):
         self.f22_bulk_resync_btn = QPushButton("단말 재동기화")
         self.f22_bulk_resync_btn.setObjectName("SettingsActionBtn")
         self.f22_bulk_resync_btn.setToolTip(
-            "재직 사원 중 카드·지문이 있는 사원을 단말에 UPDATE로 다시 전송합니다. "
-            "단말 사용자 삭제는 하지 않습니다."
+            "재직 사원 중 카드·지문이 있는 사원을 단말에 맞춥니다. "
+            "DB에 없는 사번, 퇴사자, 카드·지문이 없는 사번은 단말에서 삭제합니다."
         )
         self.f22_bulk_resync_btn.clicked.connect(self._on_f22_bulk_resync)
         actions_row.addWidget(self.f22_bulk_resync_btn)
@@ -4439,10 +5045,11 @@ class SettingsScreen(QWidget):
             conn_ic = getattr(self.main_win, "_term_conn_icon", None)
             disconn_ic = getattr(self.main_win, "_term_disconn_icon", None)
         render_terminal_status_rows(lay, rep, conn_ic, disconn_ic, compact=True)
-        # 각 섹션 테이블의 상태(ON/OFF) 열 갱신
+        # 단말 표는 단말 연결, 프린터·경광등은 각 IP 접속 결과
         self._refresh_printer_table()
         self._refresh_qlight_table()
         self._refresh_f22_table()
+        self._schedule_aux_device_probe()
 
     def refresh_connection_status_now(self):
         if self.main_win is not None:
@@ -4554,8 +5161,8 @@ class SettingsScreen(QWidget):
             self.qlight_table.setItem(i, 1, QTableWidgetItem(linked))
             self.qlight_table.setItem(i, 2, QTableWidgetItem(str(row.get("ip", ""))))
             self.qlight_table.setItem(i, 3, QTableWidgetItem(str(row.get("port", ""))))
-            ok = self._is_terminal_connected(device_no=linked)
-            self.qlight_table.setItem(i, 4, self._status_on_off_item(ok))
+            ok = self._is_aux_device_online(row.get("ip"), row.get("port"))
+            self.qlight_table.setItem(i, 4, self._aux_status_item(ok))
         self.qlight_table.setSortingEnabled(True)
 
     def _qlight_data_index_from_current_row(self):
@@ -4746,8 +5353,8 @@ class SettingsScreen(QWidget):
             self.printer_table.setItem(i, 1, QTableWidgetItem(linked))
             self.printer_table.setItem(i, 2, QTableWidgetItem(str(row.get("ip", ""))))
             self.printer_table.setItem(i, 3, QTableWidgetItem(str(row.get("port", ""))))
-            ok = self._is_terminal_connected(device_no=linked)
-            self.printer_table.setItem(i, 4, self._status_on_off_item(ok))
+            ok = self._is_aux_device_online(row.get("ip"), row.get("port"))
+            self.printer_table.setItem(i, 4, self._aux_status_item(ok))
         self.printer_table.setSortingEnabled(True)
 
     def _printer_data_index_from_current_row(self):
@@ -5118,6 +5725,50 @@ class SettingsScreen(QWidget):
         self._refresh_linked_terminal_combos()
         self._apply_printer_enables()
         self._apply_qlight_enables()
+        self._schedule_aux_device_probe()
+
+    def _aux_device_key(self, ip, port) -> str:
+        try:
+            port_i = int(port)
+        except (TypeError, ValueError):
+            return ""
+        host = str(ip or "").strip()
+        if not host:
+            return ""
+        return "%s:%s" % (host, port_i)
+
+    def _is_aux_device_online(self, ip, port) -> bool:
+        key = self._aux_device_key(ip, port)
+        if not key:
+            return False
+        return bool(getattr(self, "_device_online", {}).get(key, False))
+
+    def _aux_status_item(self, ok: bool) -> QTableWidgetItem:
+        item = self._status_on_off_item(ok)
+        item.setToolTip("장치 접속됨" if ok else "장치 접속 안 됨")
+        return item
+
+    def _schedule_aux_device_probe(self):
+        prev = getattr(self, "_aux_probe_loader", None)
+        if prev is not None and prev.isRunning():
+            self._aux_probe_pending = True
+            return
+        self._aux_probe_pending = False
+        printers = list(getattr(self, "_printer_devices_data", []) or [])
+        qlights = list(getattr(self, "_qlight_devices_data", []) or [])
+        loader = DataLoader(_probe_printer_qlight, printers, qlights)
+        loader.finished.connect(self._on_aux_device_probe)
+        self._aux_probe_loader = loader
+        loader.start()
+
+    def _on_aux_device_probe(self, result):
+        if isinstance(result, dict):
+            self._device_online = result
+        self._refresh_printer_table()
+        self._refresh_qlight_table()
+        if getattr(self, "_aux_probe_pending", False):
+            self._aux_probe_pending = False
+            QTimer.singleShot(0, self._schedule_aux_device_probe)
 
     def save_settings(self, quiet=False):
         if not self.api:
@@ -5216,6 +5867,7 @@ class SettingsScreen(QWidget):
         }
         ok, result = self.api.put_device_settings(payload)
         if ok:
+            self._schedule_aux_device_probe()
             if not quiet:
                 QMessageBox.information(self, "저장 완료", "장치 설정이 저장되었습니다.")
         else:
@@ -5348,8 +6000,10 @@ class SettingsScreen(QWidget):
                 return
 
         confirm = (
-            "재직 사원 중 카드 또는 지문이 등록된 사원을 단말에 다시 전송합니다.\n"
-            "(UPDATE만 수행하며, 단말 사용자 삭제는 하지 않습니다.)\n\n"
+            "DB와 단말을 비교해 단말 사용자를 DB와 같게 맞춥니다.\n"
+            "재직이면서 카드 또는 지문이 있는 사원만 단말에 남기고 다시 등록합니다.\n"
+            "DB에 없거나 퇴사자, 카드·지문이 없는 사번은 단말에서 삭제합니다.\n"
+            "단말 관리자 계정은 삭제하지 않습니다.\n\n"
             "대상 단말: %s\n\n"
             "계속하시겠습니까?" % term_desc
         )
@@ -5383,7 +6037,8 @@ class SettingsScreen(QWidget):
         self._f22_bulk_resync_thread = None
         body = _f22_bulk_resync_dialog_text(summary if isinstance(summary, dict) else {})
         fail = int((summary or {}).get("fail_emp") or 0) if isinstance(summary, dict) else 1
-        if fail > 0 or (isinstance(summary, dict) and summary.get("cancelled")):
+        delete_fail = int((summary or {}).get("delete_fail") or 0) if isinstance(summary, dict) else 0
+        if fail > 0 or delete_fail > 0 or (isinstance(summary, dict) and summary.get("cancelled")):
             QMessageBox.warning(self, "단말 재동기화 완료", body)
         else:
             QMessageBox.information(self, "단말 재동기화 완료", body)
@@ -6929,6 +7584,9 @@ class MainWindow(QMainWindow):
     def switch_screen(self, idx):
         if getattr(self, "_dashboard_stats_timer", None):
             self._dashboard_stats_timer.stop()
+        prev = self.stack.currentIndex()
+        if prev == 4 and idx != 4 and hasattr(self, "raw_data"):
+            self.raw_data.reset_view()
         self.stack.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_btns):
             btn.setProperty("active", "true" if i == idx else "false")

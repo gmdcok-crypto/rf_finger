@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from meal_db.adms_commands import (
     AdmsCmdProtocol,
@@ -30,12 +31,13 @@ from meal_db.adms_push_server import (
 
 
 def _terminal_label(t: dict) -> str:
-    dno = str(t.get("device_no") or "").strip()
-    if dno:
-        return dno
-    ip = str(t.get("ip") or t.get("host") or "").strip()
+    from meal_db.f22_sync import sync_terminal_name
+
+    name = sync_terminal_name(t)
+    if name != "단말":
+        return name
     sn = _terminal_config_sn(t)
-    return ip or sn or "단말"
+    return sn or "단말"
 
 
 def resolve_terminal_adms_sn(t: dict, registry: Dict[str, dict]) -> str:
@@ -257,6 +259,155 @@ def sync_employee_via_adms(
     return out
 
 
+def parse_adms_user_rows(body: str) -> List[Tuple[str, int]]:
+    """querydata 사용자 본문 → (사번, privilege)."""
+    out: List[Tuple[str, int]] = []
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line or "=" not in line:
+            continue
+        fields: Dict[str, str] = {}
+        for part in re.split(r"[\s\t]+", line):
+            if "=" not in part:
+                continue
+            key, _, val = part.partition("=")
+            fields[key.strip().lower()] = val.strip()
+        pin = fields.get("pin") or fields.get("user_id") or fields.get("userid") or ""
+        if not pin:
+            continue
+        try:
+            priv = int(fields.get("privilege") or "0")
+        except (TypeError, ValueError):
+            priv = 0
+        out.append((pin, priv))
+    return out
+
+
+def prune_terminal_users_via_adms(
+    settings: dict | None,
+    keep_emp_nos: Set[str],
+    terminals_only: Optional[List[dict]] = None,
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """단말 사용자 중 DB에 둘 사번이 아닌 일반 사용자를 삭제한다. 관리자(privilege≠0)는 남긴다."""
+    srv = get_runtime_adms_server()
+    if srv is None or not srv.is_running():
+        return {
+            "ok": False,
+            "deleted": 0,
+            "delete_fail": 0,
+            "kept_admin": 0,
+            "cancelled": False,
+            "errors": ["ADMS 연결 서버가 실행 중이 아닙니다."],
+        }
+
+    terminals = _terminals_for_sync(settings, terminals_only)
+    if not terminals:
+        return {
+            "ok": False,
+            "deleted": 0,
+            "delete_fail": 0,
+            "kept_admin": 0,
+            "cancelled": False,
+            "errors": ["설정에 등록된 단말이 없습니다."],
+        }
+
+    registry = srv.get_registry_snapshot()
+    timeout = _command_timeout_sec()
+    query_timeout = max(120.0, timeout)
+    deleted = 0
+    delete_fail = 0
+    kept_admin = 0
+    errors: List[str] = []
+    keep = {str(x).strip() for x in keep_emp_nos if str(x).strip()}
+
+    for t in terminals:
+        if cancel_check and cancel_check():
+            return {
+                "ok": True,
+                "deleted": deleted,
+                "delete_fail": delete_fail,
+                "kept_admin": kept_admin,
+                "cancelled": True,
+                "errors": errors,
+            }
+        if not isinstance(t, dict):
+            continue
+        label = _terminal_label(t)
+        sn = resolve_terminal_adms_sn(t, registry)
+        if not sn:
+            errors.append("[%s] 단말 SN 미확인 — 삭제를 건너뜀" % label)
+            continue
+        if on_progress:
+            on_progress("%s 사용자 목록 조회 중…" % label)
+        from meal_db.adms_commands import build_user_query_command
+
+        ok, msg, body, count = srv.query_user_command(
+            sn, build_user_query_command(), timeout_sec=query_timeout
+        )
+        if not ok:
+            ok, msg, body, count = srv.query_user_command(
+                sn,
+                build_user_query_command(protocol="legacy"),
+                timeout_sec=query_timeout,
+            )
+        if not ok:
+            errors.append("[%s] 사용자 목록 조회 실패 — %s" % (label, msg))
+            continue
+        if count > 0 and not (body or "").strip():
+            errors.append(
+                "[%s] 사용자 %d명 응답인데 목록 본문이 없습니다. 삭제를 건너뜁니다."
+                % (label, count)
+            )
+            continue
+        rows = parse_adms_user_rows(body)
+        extras = []
+        for pin, priv in rows:
+            if priv != 0:
+                kept_admin += 1
+                continue
+            if pin not in keep:
+                extras.append(pin)
+        for pin in extras:
+            if cancel_check and cancel_check():
+                return {
+                    "ok": True,
+                    "deleted": deleted,
+                    "delete_fail": delete_fail,
+                    "kept_admin": kept_admin,
+                    "cancelled": True,
+                    "errors": errors,
+                }
+            if on_progress:
+                on_progress("%s 사번 %s 삭제 중…" % (label, pin))
+            auth_del = build_userauthorize_delete_command(pin, protocol="security")
+            if auth_del:
+                srv.queue_user_command(sn, auth_del, timeout_sec=timeout)
+            del_ok, del_msg, _proto = _queue_with_protocol_fallback(
+                srv,
+                sn,
+                build_user_delete_command,
+                timeout,
+                pin,
+            )
+            if del_ok:
+                deleted += 1
+            else:
+                delete_fail += 1
+                errors.append("[%s] 사번 %s 삭제 실패 — %s" % (label, pin, del_msg))
+
+    return {
+        "ok": not errors,
+        "deleted": deleted,
+        "delete_fail": delete_fail,
+        "kept_admin": kept_admin,
+        "cancelled": False,
+        "errors": errors,
+    }
+
+
 def remove_employee_via_adms(settings: dict | None, emp_no: str) -> List[Tuple[str, bool, str]]:
     srv = get_runtime_adms_server()
     if srv is None or not srv.is_running():
@@ -279,10 +430,17 @@ def remove_employee_via_adms(settings: dict | None, emp_no: str) -> List[Tuple[s
     for t in terminals:
         if not isinstance(t, dict):
             continue
+        label = _terminal_label(t)
         sn = resolve_terminal_adms_sn(t, registry)
         if not sn:
+            out.append(
+                (
+                    label,
+                    False,
+                    "단말 SN 미확인 — 단말이 ADMS로 PC에 접속했는지 확인하세요.",
+                )
+            )
             continue
-        label = _terminal_label(t)
         auth_del = build_userauthorize_delete_command(eno, protocol="security")
         if auth_del:
             srv.queue_user_command(sn, auth_del, timeout_sec=timeout)

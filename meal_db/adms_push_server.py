@@ -7,6 +7,7 @@ ZKTeco ADMS / Security PUSH (HTTP /iclock/*) 최소 수신 서버.
 환경 변수:
   MEAL_ADMS_PUSH_HOST  (기본 0.0.0.0)
   MEAL_ADMS_PUSH_PORT  (기본 8088)
+  MEAL_ADMS_TIME_SYNC_SEC  (기본 600, 단말 시계를 PC 시각으로 맞추는 간격. 0이면 끔)
 """
 
 from __future__ import annotations
@@ -17,12 +18,18 @@ import os
 import re
 import secrets
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from meal_db.adms_commands import AdmsCommandQueue, parse_devicecmd_body
+from meal_db.adms_commands import (
+    AdmsCommandQueue,
+    build_rtdata_time_body,
+    build_set_datetime_command,
+    parse_devicecmd_body,
+)
 
 _runtime_adms_server: Optional["AdmsPushServer"] = None
 _runtime_lock = threading.Lock()
@@ -326,6 +333,8 @@ class AdmsPushServer:
         self._on_status = on_status
         self._registry = _AdmsRegistry()
         self._cmd_queue = AdmsCommandQueue()
+        self._time_sync_lock = threading.Lock()
+        self._time_sync_at: Dict[str, float] = {}
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -347,6 +356,42 @@ class AdmsPushServer:
     ) -> Tuple[bool, str]:
         """getrequest 큐에 명령 넣고 단말 devicecmd 응답까지 대기."""
         return self._cmd_queue.queue_and_wait(sn, command, timeout_sec)
+
+    def query_user_command(
+        self,
+        sn: str,
+        command: str,
+        timeout_sec: float = 120.0,
+    ) -> Tuple[bool, str, str, int]:
+        """조회 명령. devicecmd 전에 올라온 querydata 본문과 return 건수를 반환."""
+        cmd_id = self._cmd_queue.enqueue(sn, command)
+        return self._cmd_queue.wait_query(cmd_id, timeout_sec)
+
+    def _time_sync_interval_sec(self) -> int:
+        try:
+            sec = int(os.environ.get("MEAL_ADMS_TIME_SYNC_SEC", "600") or "600")
+        except (TypeError, ValueError):
+            sec = 600
+        if sec <= 0:
+            return 0
+        return max(30, min(24 * 60 * 60, sec))
+
+    def _take_time_sync_line(self, sn: str) -> str:
+        """주기마다 단말 시계를 PC 로컬 시각으로 맞추는 getrequest 한 줄."""
+        sn = (sn or "").strip()
+        interval = self._time_sync_interval_sec()
+        if not sn or interval <= 0:
+            return ""
+        now_m = time.monotonic()
+        with self._time_sync_lock:
+            last = self._time_sync_at.get(sn, 0.0)
+            if now_m - last < interval:
+                return ""
+            self._time_sync_at[sn] = now_m
+        cmd_id = self._cmd_queue.alloc_id()
+        command = build_set_datetime_command()
+        self._log("ADMS 시각 동기화 SN=%s %s" % (sn, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        return "C:%d:%s\n" % (cmd_id, command)
 
     def _log(self, msg: str) -> None:
         if self._on_status:
@@ -489,6 +534,9 @@ class AdmsPushServer:
                 if path.endswith("/getrequest"):
                     ip = self._touch_sn(sn)
                     resp = server_ref._cmd_queue.pop_response_text(sn)
+                    time_line = server_ref._take_time_sync_line(sn)
+                    if time_line:
+                        resp = time_line if resp == "OK" else (time_line + resp)
                     if resp != "OK":
                         preview = resp.replace("\n", " | ").strip()[:160]
                         server_ref._log(
@@ -510,6 +558,12 @@ class AdmsPushServer:
                 if path.endswith("/ping"):
                     self._send(200, "OK")
                     return
+                if path.endswith("/rtdata"):
+                    kind = (q.get("type") or [""])[0].strip().lower()
+                    if kind in ("", "time"):
+                        self._touch_sn(sn)
+                        self._send(200, build_rtdata_time_body())
+                        return
                 self._send(404, "Not Found")
 
             def do_POST(self):
@@ -545,6 +599,22 @@ class AdmsPushServer:
                             % (sn, cmd_id, ret, cmd_echo or "-")
                         )
                     self._send(200, "OK")
+                    return
+                if path.endswith("/querydata"):
+                    raw_id = (q.get("cmdid") or q.get("CmdID") or ["0"])[0]
+                    try:
+                        cmd_id = int(raw_id or 0)
+                    except (TypeError, ValueError):
+                        cmd_id = 0
+                    if cmd_id and (body or "").strip():
+                        server_ref._cmd_queue.append_query_body(cmd_id, body)
+                    tablename = str((q.get("tablename") or ["user"])[0] or "user").strip() or "user"
+                    count = str((q.get("count") or ["0"])[0] or "0").strip() or "0"
+                    server_ref._log(
+                        "ADMS querydata SN=%s cmd=%s table=%s count=%s"
+                        % (sn, cmd_id or "-", tablename, count)
+                    )
+                    self._send(200, "%s=%s" % (tablename, count))
                     return
                 if path.endswith("/cdata"):
                     ingest_table = (table or "").strip()

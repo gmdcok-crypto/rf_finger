@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -28,19 +29,32 @@ def _parse_dotenv_line(line: str) -> Optional[Tuple[str, str]]:
     return key, val
 
 
-def load_meal_db_dotenv() -> None:
-    """프로젝트 루트 또는 현재 작업 디렉터리의 `.env`에서 MEAL_* 환경 변수를 로드한다.
-
-    MEAL_DB_* 뿐 아니라 MEAL_F22_ATT_MODE, MEAL_ADMS_PUSH_* 등 앱 설정도 포함.
-    이미 설정된 환경 변수는 덮어쓰지 않는다.
-    """
+def _dotenv_candidates() -> List[Path]:
+    """exe 옆, exe 상위(프로젝트 루트), 개발 시 소스 루트, 현재 폴더 순."""
     paths: List[Path] = []
     explicit = (os.environ.get("MEAL_DB_ENV_FILE") or "").strip()
     if explicit:
         paths.append(Path(explicit))
-    # 프로젝트 루트를 cwd 보다 먼저 (어디서 실행해도 meal_rf_finger/.env 우선)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        paths.append(exe_dir / ".env")
+        parent = exe_dir
+        for _ in range(4):
+            parent = parent.parent
+            paths.append(parent / ".env")
     paths.append(Path(__file__).resolve().parent.parent / ".env")
     paths.append(Path.cwd() / ".env")
+    return paths
+
+
+def load_meal_db_dotenv() -> None:
+    """`.env`에서 MEAL_* 환경 변수를 로드한다.
+
+    빌드된 exe는 exe와 같은 폴더, 그리고 그 상위 폴더(프로젝트 루트)를 본다.
+    MEAL_DB_* 뿐 아니라 MEAL_F22_ATT_MODE, MEAL_ADMS_PUSH_* 등 앱 설정도 포함.
+    이미 설정된 환경 변수는 덮어쓰지 않는다.
+    """
+    paths = _dotenv_candidates()
     seen: set = set()
 
     def _apply_meal_key(k: str, v: str) -> None:
@@ -170,8 +184,8 @@ def _password_hint(kw: Dict[str, Any], err_text: str) -> str:
     if "using password: no" in et or ("access denied" in et and "password" in et):
         return (
             "\n비밀번호 미전달: MEAL_DB_PASSWORD 가 비어 있습니다.\n"
-            "프로젝트 폴더(`meal_rf_finger`)에 `.env` 파일을 두고 한 줄로 넣으세요: MEAL_DB_PASSWORD=실제비밀번호\n"
-            "(`.env.example` 참고) 또는 Windows 시스템 환경 변수에 MEAL_DB_PASSWORD 를 등록하세요."
+            "`.env`를 pc_app.exe 와 같은 폴더에 두거나, 프로젝트 폴더(`meal_rf_finger`)에 두세요.\n"
+            "한 줄: MEAL_DB_PASSWORD=실제비밀번호"
         )
     return ""
 
@@ -182,7 +196,7 @@ def _connection_diagnostics(kw: Dict[str, Any], err_text: str = "") -> str:
         "드라이버: %s\n"
         "접속: host=%s port=%s database=%s user=%s\n"
         "환경변수: MEAL_DB_HOST, MEAL_DB_PORT, MEAL_DB_USER, MEAL_DB_PASSWORD, MEAL_DB_NAME\n"
-        "로컬 설정 파일: 프로젝트 루트 `.env` (MEAL_DB_* 만 자동 로드)\n"
+        "로컬 설정 파일: exe 옆 또는 프로젝트 루트 `.env`\n"
         "스키마 생성: python -m meal_db.apply_schema"
         % (driver_info(), kw.get("host"), kw.get("port"), kw.get("database"), safe_user)
     )

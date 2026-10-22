@@ -479,6 +479,65 @@ def remove_user_from_terminal(
                 pass
 
 
+def prune_users_not_in(
+    host: str,
+    port: int,
+    comm_password: int,
+    keep_user_ids: set,
+) -> tuple[bool, str, int, int]:
+    """keep 에 없는 일반 사용자(privilege 0)를 삭제한다. 반환: ok, 메시지, 삭제 수, 남긴 관리자 수."""
+    from zk import ZK
+
+    ip = (host or "").strip()
+    if not ip:
+        return False, "IP가 비었습니다.", 0, 0
+    keep = {str(x).strip() for x in (keep_user_ids or set()) if str(x).strip()}
+    zk = ZK(ip, port=int(port), password=int(comm_password), timeout=25, ommit_ping=True)
+    conn = None
+    try:
+        conn = zk.connect()
+    except Exception as e:
+        return False, str(e), 0, 0
+    deleted = 0
+    kept_admin = 0
+    try:
+        try:
+            conn.disable_device()
+        except Exception:
+            pass
+        users = conn.get_users() or []
+        for u in users:
+            uid_s = str(getattr(u, "user_id", "") or "").strip()
+            if not uid_s or uid_s in keep:
+                continue
+            try:
+                priv = int(getattr(u, "privilege", 0) or 0)
+            except (TypeError, ValueError):
+                priv = 0
+            if priv != 0:
+                kept_admin += 1
+                continue
+            conn.delete_user(uid=u.uid)
+            deleted += 1
+        try:
+            conn.enable_device()
+        except Exception:
+            pass
+        return True, "OK", deleted, kept_admin
+    except Exception as e:
+        try:
+            conn.enable_device()
+        except Exception:
+            pass
+        return False, str(e), deleted, kept_admin
+    finally:
+        if conn is not None:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+
 def pick_f22_terminal_for_import(settings: dict | None) -> dict | None:
     """
     지문 템플릿 가져오기 등에 쓸 단말 1대 선택.

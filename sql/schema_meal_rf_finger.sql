@@ -5,27 +5,22 @@ SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 
 CREATE TABLE IF NOT EXISTS companies (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  code VARCHAR(32) NOT NULL,
+  code VARCHAR(32) NOT NULL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_companies_code (code)
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS departments (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  company_id BIGINT NOT NULL,
-  code VARCHAR(32) NOT NULL,
+  code VARCHAR(32) NOT NULL PRIMARY KEY,
+  company_code VARCHAR(32) NOT NULL,
   name VARCHAR(255) NOT NULL,
-  UNIQUE KEY uq_dept_company_code (company_id, code),
-  CONSTRAINT fk_dept_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+  CONSTRAINT fk_dept_company FOREIGN KEY (company_code) REFERENCES companies(code) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS employees (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  company_id BIGINT NOT NULL,
-  department_id BIGINT NULL,
-  emp_no VARCHAR(64) NOT NULL,
+  emp_no VARCHAR(64) NOT NULL PRIMARY KEY,
+  company_code VARCHAR(32) NOT NULL,
+  department_code VARCHAR(32) NULL,
   name VARCHAR(255) NOT NULL,
   status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
   rf_card_uid VARCHAR(128) NULL,
@@ -37,16 +32,13 @@ CREATE TABLE IF NOT EXISTS employees (
   fingerprint_slot_fid_2 TINYINT UNSIGNED NULL,
   fingerprint_slot_fid_3 TINYINT UNSIGNED NULL,
   fingerprint_slot_fid_4 TINYINT UNSIGNED NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_emp_company_no (company_id, emp_no),
-  CONSTRAINT fk_emp_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
-  CONSTRAINT fk_emp_dept FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL
+  CONSTRAINT fk_emp_company FOREIGN KEY (company_code) REFERENCES companies(code) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_emp_dept FOREIGN KEY (department_code) REFERENCES departments(code) ON DELETE SET NULL ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS policies (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  company_id BIGINT NULL,
+  company_code VARCHAR(32) NULL,
   meal_type VARCHAR(64) NOT NULL,
   start_time TIME NOT NULL,
   end_time TIME NOT NULL,
@@ -54,12 +46,12 @@ CREATE TABLE IF NOT EXISTS policies (
   guest_price INT NOT NULL DEFAULT 0,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_policy_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+  CONSTRAINT fk_policy_company FOREIGN KEY (company_code) REFERENCES companies(code) ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS meal_logs (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  employee_id BIGINT NOT NULL,
+  emp_no VARCHAR(64) NOT NULL,
   policy_id BIGINT NULL,
   created_at DATETIME NOT NULL,
   guest_count INT NOT NULL DEFAULT 0,
@@ -68,10 +60,10 @@ CREATE TABLE IF NOT EXISTS meal_logs (
   void_reason VARCHAR(512) NULL,
   auth_uid VARCHAR(128) NULL,
   path VARCHAR(64) NULL DEFAULT 'local',
-  CONSTRAINT fk_log_emp FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_log_emp FOREIGN KEY (emp_no) REFERENCES employees(emp_no) ON DELETE RESTRICT ON UPDATE CASCADE,
   CONSTRAINT fk_log_policy FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE SET NULL,
   KEY idx_meal_logs_created (created_at),
-  KEY idx_meal_logs_emp_created (employee_id, created_at),
+  KEY idx_meal_logs_emp_created (emp_no, created_at),
   UNIQUE KEY uq_meal_logs_auth_uid (auth_uid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -118,8 +110,8 @@ CREATE TABLE IF NOT EXISTS admins (
 
 SET FOREIGN_KEY_CHECKS = 1;
 
-INSERT IGNORE INTO companies (id, code, name) VALUES (1, 'HQ', '본사');
-INSERT IGNORE INTO departments (id, company_id, code, name) VALUES (1, 1, 'DEFAULT', '기본부서');
+INSERT IGNORE INTO companies (code, name) VALUES ('HQ', '본사');
+INSERT IGNORE INTO departments (code, company_code, name) VALUES ('DEFAULT', 'HQ', '기본부서');
 INSERT IGNORE INTO device_settings (id, payload_json) VALUES (1, '{}');
 INSERT IGNORE INTO attlog_clear_settings (id, enabled, minutes_after_meal_end) VALUES (1, 1, 10);
 

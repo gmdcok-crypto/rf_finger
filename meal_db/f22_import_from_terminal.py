@@ -84,13 +84,12 @@ def import_fingerprint_templates_from_f22_terminal(
     with get_connection() as conn_sql:
         cur = conn_sql.cursor()
         cur.execute(
-            "SELECT id FROM employees WHERE emp_no = %s LIMIT 1",
+            "SELECT emp_no FROM employees WHERE emp_no = %s LIMIT 1",
             (emp_no,),
         )
         row = cur.fetchone()
     if not row:
         return False, "DB에 해당 사번 사원이 없습니다."
-    emp_id = int(row["id"])
 
     client = LocalMealClient()
     settings = client.get_device_settings() or {}
@@ -185,13 +184,13 @@ def import_fingerprint_templates_from_f22_terminal(
                     payload[tpl_keys[j]] = None
                     payload[fid_keys[j]] = None
 
-        ok, res = client.update_employee(emp_id, payload)
+        ok, res = client.update_employee(emp_no, payload)
         if not ok:
             return False, str(res)
 
         with get_connection() as conn2:
             cur2 = conn2.cursor()
-            cur2.execute("SELECT * FROM employees WHERE id = %s", (emp_id,))
+            cur2.execute("SELECT * FROM employees WHERE emp_no = %s", (emp_no,))
             er = cur2.fetchone()
         if not er:
             return False, "DB에서 사원을 다시 읽지 못했습니다."

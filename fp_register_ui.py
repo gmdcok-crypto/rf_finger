@@ -733,14 +733,14 @@ class FingerprintEnrollTwoFingerThread(QThread):
 class FingerprintRegisterDialog(QDialog):
     """Live20R USB — DB 저장 + 단말 동기화 후 saved_employee dict 반환."""
 
-    def __init__(self, api, parent, emp_id, emp_no, name, company_id, department_id, rf_card_uid):
+    def __init__(self, api, parent, emp_id, emp_no, name, company_code, department_code, rf_card_uid):
         super().__init__(parent)
         self.api = api
         self.emp_id = emp_id
         self.emp_no = (emp_no or "").strip()
         self.emp_name = (name or "").strip()
-        self.company_id = company_id
-        self.department_id = department_id
+        self.company_code = company_code
+        self.department_code = department_code
         self.rf_card_uid = (rf_card_uid or "").strip()
         self.saved_employee = None
         self.terminal_synced = False
@@ -931,8 +931,8 @@ class FingerprintRegisterDialog(QDialog):
         b64_1 = base64.b64encode(slot0).decode("ascii")
         b64_2 = base64.b64encode(slot1).decode("ascii")
         payload = {
-            "company_id": self.company_id,
-            "department_id": self.department_id,
+            "company_code": self.company_code,
+            "department_code": self.department_code,
             "emp_no": self.emp_no,
             "name": self.emp_name,
             "rf_card_uid": self.rf_card_uid or None,

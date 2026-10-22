@@ -11,7 +11,9 @@ import base64
 import os
 import re
 import threading
+import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, List, Literal, Tuple
 
 AdmsCmdProtocol = Literal["security", "legacy"]
@@ -70,6 +72,42 @@ def _rfid_to_card_str(rf: str) -> str:
             return str(int(s, 16) & 0xFFFFFFFF)
         except ValueError:
             return s
+
+
+def encode_zk_old_time(dt: datetime) -> int:
+    """Appendix 5 OldEncodeTime. 시간대 없이 년월일시분초만 초 값으로 묶는다."""
+    return (
+        ((int(dt.year) - 2000) * 12 * 31 + (int(dt.month) - 1) * 31 + int(dt.day) - 1) * 86400
+        + (int(dt.hour) * 60 + int(dt.minute)) * 60
+        + int(dt.second)
+    )
+
+
+def server_tz_token(dt: datetime | None = None) -> str:
+    """PC 로컬 오프셋. 예: 한국 +0900."""
+    local = dt.astimezone() if dt is not None and dt.tzinfo is not None else datetime.now().astimezone()
+    offset = local.utcoffset() or timedelta(0)
+    total = int(offset.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    total = abs(total)
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    return "%s%02d%02d" % (sign, hours, minutes)
+
+
+def build_set_datetime_command(dt: datetime | None = None) -> str:
+    """단말 시계를 PC 로컬 시각으로. C:ID: 접두 없음."""
+    local = dt or datetime.now()
+    if local.tzinfo is not None:
+        local = local.astimezone().replace(tzinfo=None)
+    return "SET OPTIONS DateTime=%d" % encode_zk_old_time(local)
+
+
+def build_rtdata_time_body(dt: datetime | None = None) -> str:
+    """GET /iclock/rtdata?type=time 응답. DateTime은 UTC, ServerTZ는 PC 오프셋."""
+    local = (dt or datetime.now()).astimezone()
+    utc = local.astimezone(timezone.utc).replace(tzinfo=None)
+    return "DateTime=%d,ServerTZ=%s" % (encode_zk_old_time(utc), server_tz_token(local))
 
 
 def build_user_update_command(
@@ -154,6 +192,14 @@ def build_userauthorize_delete_command(pin: str, *, protocol: AdmsCmdProtocol | 
     return "DATA DELETE userauthorize Pin=%s" % pin
 
 
+def build_user_query_command(*, protocol: AdmsCmdProtocol | None = None) -> str:
+    """단말에 등록된 사용자 목록 조회. 결과는 /iclock/querydata 로 올라온다."""
+    proto = protocol or adms_cmd_protocol()
+    if proto == "legacy":
+        return "DATA QUERY tablename=USERINFO,fielddesc=*,filter=*"
+    return "DATA QUERY tablename=user,fielddesc=*,filter=*"
+
+
 def build_user_delete_command(pin: str, *, protocol: AdmsCmdProtocol | None = None) -> str:
     pin = str(pin or "").strip()
     proto = protocol or adms_cmd_protocol()
@@ -214,6 +260,7 @@ class AdmsCommandQueue:
         self._next_id = 1
         self._by_sn: Dict[str, Deque[dict]] = {}
         self._pending: Dict[int, dict] = {}
+        self._query_late: Dict[int, List[str]] = {}
 
     def enqueue(self, sn: str, command: str) -> int:
         sn = (sn or "").strip()
@@ -229,9 +276,17 @@ class AdmsCommandQueue:
                 "done": threading.Event(),
                 "return_code": None,
                 "cmd_echo": "",
+                "query_parts": [],
             }
             self._pending[cmd_id] = entry
             self._by_sn.setdefault(sn, deque()).append(entry)
+            return cmd_id
+
+    def alloc_id(self) -> int:
+        """대기 없이 내려보내는 명령(시각 동기화)용 ID."""
+        with self._lock:
+            cmd_id = int(self._next_id)
+            self._next_id += 1
             return cmd_id
 
     def pop_response_text(self, sn: str, max_cmds: int = 1) -> str:
@@ -252,6 +307,15 @@ class AdmsCommandQueue:
             return "OK"
         return "\n".join(lines) + "\n"
 
+    def append_query_body(self, cmd_id: int, text: str) -> None:
+        with self._lock:
+            entry = self._pending.get(int(cmd_id))
+            chunk = text or ""
+            if entry is None:
+                self._query_late.setdefault(int(cmd_id), []).append(chunk)
+                return
+            entry.setdefault("query_parts", []).append(chunk)
+
     def complete(self, sn: str, cmd_id: int, return_code: int, cmd_echo: str = "") -> None:
         with self._lock:
             entry = self._pending.get(int(cmd_id))
@@ -261,22 +325,53 @@ class AdmsCommandQueue:
             entry["cmd_echo"] = str(cmd_echo or "")
             entry["done"].set()
 
-    def wait(self, cmd_id: int, timeout_sec: float = 45.0) -> Tuple[bool, str]:
+    def _finish_wait(self, cmd_id: int, timeout_sec: float) -> Tuple[bool, str, dict]:
         with self._lock:
             entry = self._pending.get(int(cmd_id))
         if entry is None:
-            return False, "명령 ID 없음"
+            return False, "명령 ID 없음", {}
         ok = entry["done"].wait(timeout=max(1.0, float(timeout_sec)))
         with self._lock:
             entry = self._pending.pop(int(cmd_id), entry)
         if not ok:
-            return False, "단말 명령 시간 초과(getrequest 대기)"
+            return False, "단말 명령 시간 초과(getrequest 대기)", entry or {}
         rc = entry.get("return_code")
         if rc is None:
-            return False, "단말 응답 없음"
+            return False, "단말 응답 없음", entry
         if int(rc) == 0:
-            return True, "OK"
-        return False, adms_return_message(rc)
+            return True, "OK", entry
+        return False, adms_return_message(rc), entry
+
+    def wait(self, cmd_id: int, timeout_sec: float = 45.0) -> Tuple[bool, str]:
+        ok, msg, _entry = self._finish_wait(cmd_id, timeout_sec)
+        return ok, msg
+
+    def wait_query(self, cmd_id: int, timeout_sec: float = 45.0) -> Tuple[bool, str, str, int]:
+        """조회 명령. return>=0 은 성공(건수)으로 본다."""
+        ok, msg, entry = self._finish_wait(cmd_id, timeout_sec)
+        parts = entry.get("query_parts") or []
+        body = "\n".join(parts)
+        rc = entry.get("return_code")
+        try:
+            rc_i = int(rc) if rc is not None else -1
+        except (TypeError, ValueError):
+            rc_i = -1
+        if rc_i >= 0:
+            if rc_i > 0 and not body.strip():
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not body.strip():
+                    time.sleep(0.05)
+                    with self._lock:
+                        late = self._query_late.pop(int(cmd_id), [])
+                    if late:
+                        body = "\n".join(late)
+            else:
+                with self._lock:
+                    self._query_late.pop(int(cmd_id), None)
+            return True, "OK", body, rc_i
+        with self._lock:
+            self._query_late.pop(int(cmd_id), None)
+        return ok, msg, body, rc_i
 
     def queue_and_wait(
         self,

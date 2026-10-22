@@ -246,10 +246,10 @@ def _find_employee_for_terminal_user_id(cur, user_id: str) -> Optional[Dict[str,
     for cand in _terminal_user_id_lookup_candidates(user_id):
         cur.execute(
             """
-            SELECT id, company_id FROM employees
+            SELECT emp_no, company_code, name FROM employees
             WHERE status = 'ACTIVE'
               AND (emp_no = %s OR rf_card_uid = %s OR TRIM(rf_card_uid) = %s)
-            ORDER BY id LIMIT 1
+            ORDER BY emp_no LIMIT 1
             """,
             (cand, cand, cand),
         )
@@ -270,10 +270,10 @@ class LocalMealClient:
     def close(self):
         pass
 
-    def _default_company_id(self, cur) -> int:
-        cur.execute("SELECT id FROM companies ORDER BY id LIMIT 1")
+    def _default_company_code(self, cur) -> str:
+        cur.execute("SELECT code FROM companies ORDER BY code LIMIT 1")
         row = cur.fetchone()
-        return int(row["id"]) if row else 1
+        return str(row["code"]) if row and row.get("code") else "HQ"
 
     @staticmethod
     def _max_suffix_int(prefix: str, codes: List[str]) -> int:
@@ -298,8 +298,8 @@ class LocalMealClient:
             return "C%04d" % n
         return "C%d" % n
 
-    def _next_department_code(self, cur, company_id: int) -> str:
-        cur.execute("SELECT code FROM departments WHERE company_id=%s", (int(company_id),))
+    def _next_department_code(self, cur) -> str:
+        cur.execute("SELECT code FROM departments")
         rows = cur.fetchall() or []
         codes = [str(r["code"]) for r in (rows or []) if r and r.get("code") is not None]
         n = self._max_suffix_int("D", codes) + 1
@@ -311,7 +311,7 @@ class LocalMealClient:
     def get_companies(self):
         with get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT id, code, name FROM companies ORDER BY id")
+            cur.execute("SELECT code, name FROM companies ORDER BY code")
             return list(cur.fetchall())
 
     def create_company(self, code, name):
@@ -323,82 +323,114 @@ class LocalMealClient:
                 cur = conn.cursor()
                 c = self._next_company_code(cur)
                 cur.execute("INSERT INTO companies (code, name) VALUES (%s, %s)", (c, name))
-                cid = cur.lastrowid
-                cur.execute("SELECT id, code, name FROM companies WHERE id = %s", (cid,))
+                cur.execute("SELECT code, name FROM companies WHERE code = %s", (c,))
                 row = cur.fetchone()
                 return True, dict(row) if row else {}
         except Exception as e:
             return False, str(e)
 
-    def update_company(self, cid, code, name):
+    def update_company(self, old_code, code, name):
         try:
+            old_code = (old_code or "").strip()
+            code = (code or "").strip()
+            name = (name or "").strip()
+            if not old_code or not code or not name:
+                return None
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("UPDATE companies SET code=%s, name=%s WHERE id=%s", (code, name, cid))
-                cur.execute("SELECT id, code, name FROM companies WHERE id = %s", (cid,))
+                cur.execute(
+                    "UPDATE companies SET code=%s, name=%s WHERE code=%s",
+                    (code, name, old_code),
+                )
+                cur.execute("SELECT code, name FROM companies WHERE code = %s", (code,))
                 row = cur.fetchone()
                 return dict(row) if row else None
         except Exception:
             return None
 
-    def delete_company(self, cid):
+    def delete_company(self, code):
         try:
+            code = (code or "").strip()
+            if not code:
+                return False
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("DELETE FROM companies WHERE id = %s", (cid,))
+                cur.execute("DELETE FROM companies WHERE code = %s", (code,))
                 return cur.rowcount > 0
         except Exception:
             return False
 
     # --- Departments ---
-    def get_departments(self, company_id=None):
+    def get_departments(self, company_code=None):
         with get_connection() as conn:
             cur = conn.cursor()
-            if company_id is not None:
+            if company_code:
                 cur.execute(
-                    "SELECT id, company_id, code, name FROM departments WHERE company_id = %s ORDER BY id",
-                    (int(company_id),),
+                    "SELECT code, company_code, name FROM departments WHERE company_code = %s ORDER BY code",
+                    (str(company_code).strip(),),
                 )
             else:
-                cur.execute("SELECT id, company_id, code, name FROM departments ORDER BY id")
+                cur.execute("SELECT code, company_code, name FROM departments ORDER BY code")
             return list(cur.fetchall())
 
-    def create_department(self, company_id, code, name):
+    def create_department(self, company_code, code, name):
         try:
             name = (name or "").strip()
+            company_code = (company_code or "").strip()
             if not name:
                 return False, "부서명을 입력하세요."
+            if not company_code:
+                return False, "회사코드가 없습니다."
             with get_connection() as conn:
                 cur = conn.cursor()
-                c = self._next_department_code(cur, int(company_id))
+                c = self._next_department_code(cur)
                 cur.execute(
-                    "INSERT INTO departments (company_id, code, name) VALUES (%s, %s, %s)",
-                    (int(company_id), c, name),
+                    "INSERT INTO departments (company_code, code, name) VALUES (%s, %s, %s)",
+                    (company_code, c, name),
                 )
-                did = cur.lastrowid
-                cur.execute("SELECT id, company_id, code, name FROM departments WHERE id = %s", (did,))
+                cur.execute(
+                    "SELECT code, company_code, name FROM departments WHERE code = %s",
+                    (c,),
+                )
                 row = cur.fetchone()
                 return True, dict(row) if row else {}
         except Exception as e:
             return False, str(e)
 
-    def update_department(self, did, code, name):
+    def update_department(self, old_code, code, name):
         try:
+            old_code = (old_code or "").strip()
+            code = (code or "").strip()
+            name = (name or "").strip()
+            if not old_code or not code or not name:
+                return None
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("UPDATE departments SET code=%s, name=%s WHERE id=%s", (code, name, did))
-                cur.execute("SELECT id, company_id, code, name FROM departments WHERE id = %s", (did,))
+                cur.execute(
+                    "UPDATE departments SET code=%s, name=%s WHERE code=%s",
+                    (code, name, old_code),
+                )
+                cur.execute(
+                    "SELECT code, company_code, name FROM departments WHERE code = %s",
+                    (code,),
+                )
                 row = cur.fetchone()
                 return dict(row) if row else None
         except Exception:
             return None
 
-    def delete_department(self, did):
+    def delete_department(self, code):
         try:
+            code = (code or "").strip()
+            if not code:
+                return False
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("UPDATE employees SET department_id = NULL WHERE department_id = %s", (did,))
-                cur.execute("DELETE FROM departments WHERE id = %s", (did,))
+                cur.execute(
+                    "UPDATE employees SET department_code = NULL WHERE department_code = %s",
+                    (code,),
+                )
+                cur.execute("DELETE FROM departments WHERE code = %s", (code,))
                 return cur.rowcount > 0
         except Exception:
             return False
@@ -408,9 +440,8 @@ class LocalMealClient:
         if not row:
             return {}
         out = {
-            "id": row["id"],
-            "company_id": row["company_id"],
-            "department_id": row["department_id"],
+            "company_code": row["company_code"],
+            "department_code": row.get("department_code") or None,
             "emp_no": row["emp_no"],
             "name": row["name"],
             "status": row["status"],
@@ -451,12 +482,12 @@ class LocalMealClient:
         with get_connection() as conn:
             cur = conn.cursor()
             sql = """
-                SELECT e.id, e.company_id, e.department_id, e.emp_no, e.name, e.status,
+                SELECT e.company_code, e.department_code, e.emp_no, e.name, e.status,
                        e.rf_card_uid,
-                       (CHAR_LENGTH(COALESCE(e.fingerprint_template, '')) > 0) AS fp_has0,
-                       (CHAR_LENGTH(COALESCE(e.fingerprint_template_2, '')) > 0) AS fp_has1,
-                       (CHAR_LENGTH(COALESCE(e.fingerprint_template_3, '')) > 0) AS fp_has2,
-                       (CHAR_LENGTH(COALESCE(e.fingerprint_template_4, '')) > 0) AS fp_has3,
+                       (e.fingerprint_template IS NOT NULL) AS fp_has0,
+                       (e.fingerprint_template_2 IS NOT NULL) AS fp_has1,
+                       (e.fingerprint_template_3 IS NOT NULL) AS fp_has2,
+                       (e.fingerprint_template_4 IS NOT NULL) AS fp_has3,
                        e.fingerprint_slot_fid_1, e.fingerprint_slot_fid_2,
                        e.fingerprint_slot_fid_3, e.fingerprint_slot_fid_4
                 FROM employees e
@@ -473,13 +504,76 @@ class LocalMealClient:
             sql += " ORDER BY e.emp_no"
             cur.execute(sql, args)
             rows = cur.fetchall()
-            cur.execute("SELECT id, name FROM departments")
-            dm = {r["id"]: r["name"] for r in cur.fetchall()}
+            cur.execute("SELECT code, name FROM departments")
+            dm = {r["code"]: r["name"] for r in cur.fetchall()}
             out = []
             for r in rows:
-                dn = dm.get(r.get("department_id"), "")
+                dn = dm.get(r.get("department_code"), "")
                 out.append(self._row_to_employee(r, dn))
             return out
+
+    def find_employees_by_rf_card(self, card_no: str):
+        """카드번호(RF UID)로 사원·부서를 찾는다. 재직·퇴사 모두 포함."""
+        card = str(card_no or "").strip()
+        if not card or card == "-":
+            return True, []
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                sql = """
+                    SELECT e.emp_no, e.name, e.rf_card_uid, IFNULL(d.name, '') AS dept_name
+                    FROM employees e
+                    LEFT JOIN departments d ON d.code = e.department_code
+                    WHERE TRIM(IFNULL(e.rf_card_uid, '')) = %s
+                """
+                args: List[Any] = [card]
+                if card.isdigit():
+                    sql += """
+                        OR (
+                            TRIM(IFNULL(e.rf_card_uid, '')) REGEXP '^[0-9]+$'
+                            AND CAST(TRIM(e.rf_card_uid) AS UNSIGNED) = %s
+                        )
+                    """
+                    args.append(int(card))
+                sql += " ORDER BY e.emp_no"
+                cur.execute(sql, args)
+                rows = []
+                for r in cur.fetchall() or []:
+                    rows.append(
+                        {
+                            "emp_no": str(r.get("emp_no") or ""),
+                            "name": str(r.get("name") or ""),
+                            "dept_name": str(r.get("dept_name") or ""),
+                            "rf_card_uid": str(r.get("rf_card_uid") or ""),
+                        }
+                    )
+                return True, rows
+        except Exception as e:
+            return False, str(e)
+
+    def _rf_card_uid_duplicate_message(self, cur, rf_uid, exclude_emp_no=None):
+        """같은 UID가 다른 사원에게 있으면 저장 거절 문구. 빈 값은 허용."""
+        uid = str(rf_uid or "").strip()
+        if not uid:
+            return ""
+        sql = """
+            SELECT emp_no, name FROM employees
+            WHERE TRIM(rf_card_uid) = %s
+        """
+        args = [uid]
+        exclude = str(exclude_emp_no or "").strip()
+        if exclude:
+            sql += " AND emp_no <> %s"
+            args.append(exclude)
+        sql += " ORDER BY emp_no LIMIT 1"
+        cur.execute(sql, args)
+        row = cur.fetchone()
+        if not row:
+            return ""
+        return "UID가 중복되었습니다. (사번 %s, %s)" % (
+            str(row.get("emp_no") or ""),
+            str(row.get("name") or ""),
+        )
 
     def get_active_employees_for_f22_sync(self) -> List[dict]:
         """재직 사원 전체 — F22 일괄 동기화용 (카드·지문 템플릿 포함)."""
@@ -518,8 +612,8 @@ class LocalMealClient:
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                cid = data.get("company_id") or self._default_company_id(cur)
-                did = data.get("department_id")
+                cid = (data.get("company_code") or "").strip() or self._default_company_code(cur)
+                did = (data.get("department_code") or "").strip() or None
                 ft = data.get("fingerprint_template_b64") or None
                 ft2 = data.get("fingerprint_template_b64_2") or None
                 ft3 = data.get("fingerprint_template_b64_3") or None
@@ -528,18 +622,25 @@ class LocalMealClient:
                 sf2 = data.get("fingerprint_slot_fid_2")
                 sf3 = data.get("fingerprint_slot_fid_3")
                 sf4 = data.get("fingerprint_slot_fid_4")
+                eno = str(data.get("emp_no") or "").strip()
+                if not eno:
+                    return False, "사번을 입력하세요."
+                rf_uid = (str(data.get("rf_card_uid") or "").strip()) or None
+                dup = self._rf_card_uid_duplicate_message(cur, rf_uid)
+                if dup:
+                    return False, dup
                 cur.execute(
-                    """INSERT INTO employees (company_id, department_id, emp_no, name, status, rf_card_uid,
+                    """INSERT INTO employees (company_code, department_code, emp_no, name, status, rf_card_uid,
                        fingerprint_template, fingerprint_template_2, fingerprint_template_3, fingerprint_template_4,
                        fingerprint_slot_fid_1, fingerprint_slot_fid_2, fingerprint_slot_fid_3, fingerprint_slot_fid_4)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         cid,
                         did,
-                        data["emp_no"],
+                        eno,
                         data["name"],
                         data.get("status") or "ACTIVE",
-                        (data.get("rf_card_uid") or "") or None,
+                        rf_uid,
                         ft,
                         ft2,
                         ft3,
@@ -550,31 +651,50 @@ class LocalMealClient:
                         sf4,
                     ),
                 )
-                eid = cur.lastrowid
-                cur.execute("SELECT * FROM employees WHERE id = %s", (eid,))
+                cur.execute("SELECT * FROM employees WHERE emp_no = %s", (eno,))
                 row = cur.fetchone()
                 return True, self._row_to_employee(row, "")
         except Exception as e:
             return False, str(e)
 
-    def update_employee(self, emp_id, data: dict):
+    def update_employee(self, emp_no, data: dict):
+        key = str(emp_no or "").strip()
+        if not key:
+            return False, "사번을 입력하세요."
         try:
+            data = dict(data or {})
+            lookup = key
+            if "emp_no" in data:
+                lookup = str(data.get("emp_no") or "").strip()
+                if not lookup:
+                    return False, "사번을 입력하세요."
+                data["emp_no"] = lookup
             with get_connection() as conn:
                 cur = conn.cursor()
+                if "rf_card_uid" in data:
+                    rf_uid = (str(data.get("rf_card_uid") or "").strip()) or None
+                    data["rf_card_uid"] = rf_uid
+                    dup = self._rf_card_uid_duplicate_message(cur, rf_uid, exclude_emp_no=key)
+                    if dup:
+                        return False, dup
                 fields = []
                 args: List[Any] = []
                 mapping = {
-                    "company_id": "company_id",
-                    "department_id": "department_id",
+                    "company_code": "company_code",
+                    "department_code": "department_code",
                     "emp_no": "emp_no",
                     "name": "name",
                     "status": "status",
                     "rf_card_uid": "rf_card_uid",
                 }
                 for k, col in mapping.items():
-                    if k in data:
-                        fields.append("%s = %%s" % col)
-                        args.append(data[k])
+                    if k not in data:
+                        continue
+                    val = data[k]
+                    if k in ("company_code", "department_code", "emp_no"):
+                        val = (str(val).strip() if val is not None else "") or None
+                    fields.append("%s = %%s" % col)
+                    args.append(val)
                 if "fingerprint_template_b64" in data:
                     fields.append("fingerprint_template = %s")
                     args.append(data.get("fingerprint_template_b64") or None)
@@ -600,40 +720,41 @@ class LocalMealClient:
                     fields.append("fingerprint_slot_fid_4 = %s")
                     args.append(data.get("fingerprint_slot_fid_4"))
                 if not fields:
-                    cur.execute("SELECT * FROM employees WHERE id = %s", (emp_id,))
+                    cur.execute("SELECT * FROM employees WHERE emp_no = %s", (key,))
                     row = cur.fetchone()
                     return True, self._row_to_employee(row, "")
-                args.append(emp_id)
+                args.append(key)
                 cur.execute(
-                    "UPDATE employees SET " + ", ".join(fields) + " WHERE id = %s",
+                    "UPDATE employees SET " + ", ".join(fields) + " WHERE emp_no = %s",
                     args,
                 )
-                cur.execute("SELECT * FROM employees WHERE id = %s", (emp_id,))
+                cur.execute("SELECT * FROM employees WHERE emp_no = %s", (lookup,))
                 row = cur.fetchone()
                 return True, self._row_to_employee(row, "")
         except Exception as e:
             return False, str(e)
 
-    def delete_employee(self, emp_id, permanent=False):
+    def delete_employee(self, emp_no, permanent=False):
         """DB 반영 후 등록된 F22 단말에서 해당 사번 사용자를 삭제한다. 반환: {\"db_ok\", \"f22_report\"}."""
         try:
-            emp_no = ""
+            emp_no = str(emp_no or "").strip()
+            if not emp_no:
+                return {"db_ok": False, "f22_report": []}
             db_ok = False
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT emp_no FROM employees WHERE id = %s", (emp_id,))
+                cur.execute("SELECT emp_no FROM employees WHERE emp_no = %s", (emp_no,))
                 row = cur.fetchone()
                 if not row:
                     return {"db_ok": False, "f22_report": []}
-                emp_no = str(row.get("emp_no") or "").strip()
                 if permanent:
-                    cur.execute("DELETE FROM meal_logs WHERE employee_id = %s", (emp_id,))
-                    cur.execute("DELETE FROM employees WHERE id = %s", (emp_id,))
+                    cur.execute("DELETE FROM meal_logs WHERE emp_no = %s", (emp_no,))
+                    cur.execute("DELETE FROM employees WHERE emp_no = %s", (emp_no,))
                     db_ok = cur.rowcount > 0
                 else:
                     cur.execute(
-                        "UPDATE employees SET status = 'RESIGNED' WHERE id = %s",
-                        (emp_id,),
+                        "UPDATE employees SET status = 'RESIGNED' WHERE emp_no = %s",
+                        (emp_no,),
                     )
                     db_ok = cur.rowcount > 0
             f22_report: List[Tuple[str, bool, str]] = []
@@ -643,8 +764,218 @@ class LocalMealClient:
         except Exception:
             return {"db_ok": False, "f22_report": []}
 
-    def import_employees_excel(self, company_id, file_content):
-        return False, "로컬 DB 모드에서는 엑셀 일괄등록을 아직 지원하지 않습니다."
+    def import_employees_excel(self, company_code, file_content, replace=False):
+        """사원일괄등록 양식(xlsx). 열: 사번, 이름, 부서코드 또는 부서명, RF카드 UID.
+
+        replace 가 거짓이면 없는 사번만 추가한다.
+        참이면 해당 회사 사원·식사기록을 지운 뒤 엑셀 행만 넣는다. 넣을 행이 없으면 삭제하지 않는다.
+        """
+        try:
+            import openpyxl
+            from io import BytesIO
+        except ImportError:
+            return False, "엑셀 읽기를 위해 openpyxl이 필요합니다."
+        if not file_content:
+            return False, "파일이 비어 있습니다."
+        try:
+            wb = openpyxl.load_workbook(BytesIO(file_content), data_only=True, read_only=True)
+        except Exception as e:
+            return False, "엑셀 파일을 열 수 없습니다. xlsx 양식을 사용하세요.\n%s" % e
+        try:
+            ws = wb[wb.sheetnames[0]]
+            grid = [list(row) for row in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+        if not grid:
+            return False, "시트가 비어 있습니다."
+
+        def _norm_header(value) -> str:
+            return str(value or "").strip().lower().replace(" ", "")
+
+        aliases = {
+            "사번": "emp_no",
+            "사원번호": "emp_no",
+            "empno": "emp_no",
+            "emp_no": "emp_no",
+            "이름": "name",
+            "성명": "name",
+            "name": "name",
+            "부서코드": "department_code",
+            "departmentcode": "department_code",
+            "부서": "department_name",
+            "부서명": "department_name",
+            "rf카드uid": "rf_card_uid",
+            "rf카드": "rf_card_uid",
+            "카드uid": "rf_card_uid",
+            "카드번호": "rf_card_uid",
+            "상태": "status",
+            "status": "status",
+        }
+
+        header_idx = None
+        colmap = {}
+        for i, row in enumerate(grid[:15]):
+            mapped = {}
+            for c, cell in enumerate(row):
+                key = aliases.get(_norm_header(cell))
+                if key and key not in mapped:
+                    mapped[key] = c
+            if "emp_no" in mapped and "name" in mapped:
+                header_idx = i
+                colmap = mapped
+                break
+        if header_idx is None:
+            return False, "첫 행 근처에 사번, 이름 열이 없습니다. 사원일괄등록 양식을 사용하세요."
+
+        def _text(value) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            if isinstance(value, int):
+                return str(value)
+            return str(value).strip()
+
+        def _col(row, key) -> str:
+            idx = colmap.get(key)
+            if idx is None or idx >= len(row):
+                return ""
+            return _text(row[idx])
+
+        inserted = 0
+        skipped = 0
+        errors = []
+        seen = set()
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cid = (company_code or "").strip() or self._default_company_code(cur)
+                cur.execute("SELECT code, name FROM departments")
+                by_code = {}
+                by_name = {}
+                for d in cur.fetchall() or []:
+                    code = str(d.get("code") or "").strip()
+                    name = str(d.get("name") or "").strip()
+                    if code:
+                        by_code[code] = code
+                    if name and name not in by_name:
+                        by_name[name] = code
+                deleted = 0
+                logs_deleted = 0
+                if replace:
+                    existing = set()
+                    used_uids = {}
+                else:
+                    cur.execute("SELECT emp_no FROM employees")
+                    existing = {str(r.get("emp_no") or "").strip() for r in (cur.fetchall() or [])}
+                    cur.execute(
+                        """SELECT emp_no, rf_card_uid FROM employees
+                           WHERE rf_card_uid IS NOT NULL AND TRIM(rf_card_uid) <> ''"""
+                    )
+                    used_uids = {}
+                    for r in cur.fetchall() or []:
+                        uid = str(r.get("rf_card_uid") or "").strip()
+                        eno_have = str(r.get("emp_no") or "").strip()
+                        if uid and uid not in used_uids:
+                            used_uids[uid] = eno_have
+                pending = []
+
+                for offset, row in enumerate(grid[header_idx + 1 :], start=header_idx + 2):
+                    if not row or all(cell is None or str(cell).strip() == "" for cell in row):
+                        continue
+                    emp_no = _col(row, "emp_no")
+                    name = _col(row, "name")
+                    if emp_no.startswith("예시"):
+                        continue
+                    if not emp_no and not name:
+                        continue
+                    if not emp_no or not name:
+                        errors.append("%d행: 사번과 이름을 모두 입력하세요." % offset)
+                        continue
+                    dept_code = _col(row, "department_code")
+                    dept_name = _col(row, "department_name")
+                    if dept_code:
+                        if dept_code not in by_code:
+                            errors.append("%d행: 부서코드 %s 가 없습니다." % (offset, dept_code))
+                            continue
+                    elif dept_name:
+                        dept_code = by_name.get(dept_name) or ""
+                        if not dept_code:
+                            errors.append("%d행: 부서명 %s 가 없습니다." % (offset, dept_name))
+                            continue
+                    else:
+                        dept_code = None
+                    if emp_no in seen or emp_no in existing:
+                        skipped += 1
+                        errors.append("%d행: 사번 %s 은 이미 있습니다." % (offset, emp_no))
+                        continue
+                    rf_uid = _col(row, "rf_card_uid") or None
+                    if rf_uid:
+                        owner = used_uids.get(rf_uid)
+                        if owner:
+                            errors.append(
+                                "%d행: UID %s 이(가) 중복되었습니다. (사번 %s)"
+                                % (offset, rf_uid, owner)
+                            )
+                            continue
+                        used_uids[rf_uid] = emp_no
+                    status_raw = _col(row, "status")
+                    if status_raw in ("퇴사", "RESIGNED", "resigned"):
+                        status = "RESIGNED"
+                    else:
+                        status = "ACTIVE"
+                    pending.append((cid, dept_code, emp_no, name, status, rf_uid))
+                    seen.add(emp_no)
+                    existing.add(emp_no)
+
+                if pending:
+                    if replace:
+                        cur.execute(
+                            """DELETE ml FROM meal_logs ml
+                               INNER JOIN employees e ON e.emp_no = ml.emp_no
+                               WHERE e.company_code = %s""",
+                            (cid,),
+                        )
+                        logs_deleted = cur.rowcount
+                        cur.execute(
+                            "DELETE FROM employees WHERE company_code = %s",
+                            (cid,),
+                        )
+                        deleted = cur.rowcount
+                    for item in pending:
+                        cur.execute(
+                            """INSERT INTO employees
+                               (company_code, department_code, emp_no, name, status, rf_card_uid)
+                               VALUES (%s,%s,%s,%s,%s,%s)""",
+                            item,
+                        )
+                        inserted += 1
+        except Exception as e:
+            return False, "등록 중 오류: %s" % e
+
+        if replace and inserted == 0:
+            note = "등록할 사원이 없어 기존 데이터는 삭제하지 않았습니다."
+            if errors:
+                note += "\n\n" + "\n".join(errors[:12])
+                if len(errors) > 12:
+                    note += "\n외 %d건" % (len(errors) - 12)
+            return False, note
+
+        if replace:
+            lines = [
+                "기존 사원 %d명, 식사기록 %d건 삭제 후 등록 %d건, 건너뜀 %d건"
+                % (deleted, logs_deleted, inserted, skipped)
+            ]
+        else:
+            lines = ["추가 등록 %d건, 건너뜀 %d건" % (inserted, skipped)]
+        if errors:
+            lines.append("")
+            lines.extend(errors[:12])
+            if len(errors) > 12:
+                lines.append("외 %d건" % (len(errors) - 12))
+        if inserted == 0 and errors:
+            return False, "\n".join(lines)
+        return True, {"message": "\n".join(lines), "inserted": inserted, "skipped": skipped}
 
     def reset_device_auth(self, emp_id):
         return True, {}
@@ -790,14 +1121,14 @@ class LocalMealClient:
             slot_fid_4,
         )
 
-    def _pick_policy_for_terminal_punch(self, cur, company_id: int, dt: datetime) -> Tuple[Optional[int], int]:
+    def _pick_policy_for_terminal_punch(self, cur, company_code: str, dt: datetime) -> Tuple[Optional[int], int]:
         cur.execute(
             """
             SELECT id, start_time, end_time, base_price FROM policies
-            WHERE is_active = 1 AND (company_id = %s OR company_id IS NULL)
-            ORDER BY (company_id IS NULL), id
+            WHERE is_active = 1 AND (company_code = %s OR company_code IS NULL)
+            ORDER BY (company_code IS NULL), id
             """,
-            (company_id,),
+            (company_code,),
         )
         rows = cur.fetchall() or []
         t = dt.time()
@@ -835,8 +1166,9 @@ class LocalMealClient:
             er = _find_employee_for_terminal_user_id(cur, user_id)
             if not er:
                 return {"inserted": 0, "skipped": 0, "unknown": 1}
-            emp_id = int(er["id"])
-            cid = int(er["company_id"])
+            emp_no = str(er.get("emp_no") or "").strip()
+            emp_name = str(er.get("name") or "")
+            cid = str(er["company_code"] or "")
             key_src = terminal_attendance_stable_key(rec)
             if not key_src:
                 return {"inserted": 0, "skipped": 0, "unknown": 0}
@@ -849,9 +1181,9 @@ class LocalMealClient:
             pid, price = self._pick_policy_for_terminal_punch(cur, cid, ts)
             try:
                 cur.execute(
-                    """INSERT INTO meal_logs (employee_id, policy_id, created_at, guest_count, final_price, is_void, auth_uid, path)
+                    """INSERT INTO meal_logs (emp_no, policy_id, created_at, guest_count, final_price, is_void, auth_uid, path)
                        VALUES (%s,%s,%s,0,%s,0,%s,'terminal')""",
-                    (emp_id, pid, ts, price, auth_uid),
+                    (emp_no, pid, ts, price, auth_uid),
                 )
             except Exception as e:
                 if _mariadb_driver is not None and isinstance(
@@ -864,16 +1196,6 @@ class LocalMealClient:
                     return {"inserted": 0, "skipped": 1, "unknown": 0}
                 raise
             meal_type = ""
-            emp_no = ""
-            emp_name = ""
-            cur.execute(
-                "SELECT emp_no, name FROM employees WHERE id = %s",
-                (emp_id,),
-            )
-            erow = cur.fetchone()
-            if erow:
-                emp_no = str(erow.get("emp_no") or "")
-                emp_name = str(erow.get("name") or "")
             if pid:
                 cur.execute("SELECT meal_type FROM policies WHERE id = %s", (pid,))
                 pr = cur.fetchone()
@@ -950,6 +1272,15 @@ class LocalMealClient:
                 "event_label": str(rec.get("event_label") or ""),
                 "date_time_str": ts.strftime("%Y-%m-%d %H:%M:%S"),
             }
+
+    def delete_auth_failure_log(self, log_id):
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM auth_failure_logs WHERE id = %s", (log_id,))
+                return True, cur.rowcount > 0
+        except Exception as e:
+            return False, str(e)
 
     def get_auth_failure_logs(self, search="", start_date=None, end_date=None):
         try:
@@ -1116,10 +1447,9 @@ class LocalMealClient:
 
     def _log_row_to_api(self, row: dict) -> dict:
         user = {
-            "id": row["employee_id"],
             "name": row.get("emp_name") or "",
-            "emp_no": row.get("emp_no") or "",
-            "department_id": row.get("department_id"),
+            "emp_no": str(row.get("emp_no") or ""),
+            "department_code": row.get("department_code") or None,
             "department_name": row.get("dept_name") or "",
             "rf_card_uid": row.get("rf_card_uid") or "",
         }
@@ -1133,7 +1463,7 @@ class LocalMealClient:
             "user": user,
             "policy": policy,
             "policy_id": row.get("policy_id"),
-            "user_id": int(row["employee_id"]),
+            "emp_no": str(row.get("emp_no") or ""),
             "path": row.get("path") or "local",
             "is_void": bool(row.get("is_void")),
             "guest_count": int(row.get("guest_count") or 0),
@@ -1153,13 +1483,13 @@ class LocalMealClient:
             with get_connection() as conn:
                 cur = conn.cursor()
                 sql = """
-                    SELECT m.id, m.employee_id, m.policy_id, m.created_at, m.guest_count, m.final_price,
+                    SELECT m.id, m.emp_no, m.policy_id, m.created_at, m.guest_count, m.final_price,
                            m.is_void, m.void_reason, m.auth_uid, m.path,
-                           e.emp_no, e.name AS emp_name, e.rf_card_uid, e.department_id,
+                           e.name AS emp_name, e.rf_card_uid, e.department_code,
                            d.name AS dept_name, p.meal_type, p.base_price
                     FROM meal_logs m
-                    LEFT JOIN employees e ON m.employee_id = e.id
-                    LEFT JOIN departments d ON e.department_id = d.id
+                    LEFT JOIN employees e ON m.emp_no = e.emp_no
+                    LEFT JOIN departments d ON e.department_code = d.code
                     LEFT JOIN policies p ON m.policy_id = p.id
                     WHERE DATE(m.created_at) BETWEEN %s AND %s
                 """
@@ -1181,7 +1511,9 @@ class LocalMealClient:
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                uid = int(data["user_id"])
+                emp_no = str(data.get("emp_no") or "").strip()
+                if not emp_no:
+                    return False, "사번이 없습니다."
                 pid = data.get("policy_id")
                 guest = int(data.get("guest_count") or 0)
                 created = _parse_created_at(data["created_at"])
@@ -1192,20 +1524,20 @@ class LocalMealClient:
                     if pr:
                         price = int(pr["base_price"] or 0)
                 cur.execute(
-                    """INSERT INTO meal_logs (employee_id, policy_id, created_at, guest_count, final_price, is_void, path)
+                    """INSERT INTO meal_logs (emp_no, policy_id, created_at, guest_count, final_price, is_void, path)
                        VALUES (%s,%s,%s,%s,%s,0,'manual')""",
-                    (uid, pid, created, guest, price),
+                    (emp_no, pid, created, guest, price),
                 )
                 lid = cur.lastrowid
                 cur.execute(
                     """
-                    SELECT m.id, m.employee_id, m.policy_id, m.created_at, m.guest_count, m.final_price,
+                    SELECT m.id, m.emp_no, m.policy_id, m.created_at, m.guest_count, m.final_price,
                            m.is_void, m.auth_uid, m.path,
-                           e.emp_no, e.name AS emp_name, e.rf_card_uid, e.department_id,
+                           e.name AS emp_name, e.rf_card_uid, e.department_code,
                            d.name AS dept_name, p.meal_type, p.base_price
                     FROM meal_logs m
-                    JOIN employees e ON m.employee_id = e.id
-                    LEFT JOIN departments d ON e.department_id = d.id
+                    JOIN employees e ON m.emp_no = e.emp_no
+                    LEFT JOIN departments d ON e.department_code = d.code
                     LEFT JOIN policies p ON m.policy_id = p.id
                     WHERE m.id = %s
                     """,
@@ -1219,7 +1551,9 @@ class LocalMealClient:
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                uid = int(data["user_id"])
+                emp_no = str(data.get("emp_no") or "").strip()
+                if not emp_no:
+                    return False, "사번이 없습니다."
                 pid = data.get("policy_id")
                 guest = int(data.get("guest_count") or 0)
                 created = _parse_created_at(data["created_at"])
@@ -1230,19 +1564,19 @@ class LocalMealClient:
                     if pr:
                         price = int(pr["base_price"] or 0)
                 cur.execute(
-                    """UPDATE meal_logs SET employee_id=%s, policy_id=%s, created_at=%s, guest_count=%s, final_price=%s
+                    """UPDATE meal_logs SET emp_no=%s, policy_id=%s, created_at=%s, guest_count=%s, final_price=%s
                        WHERE id = %s""",
-                    (uid, pid, created, guest, price, log_id),
+                    (emp_no, pid, created, guest, price, log_id),
                 )
                 cur.execute(
                     """
-                    SELECT m.id, m.employee_id, m.policy_id, m.created_at, m.guest_count, m.final_price,
+                    SELECT m.id, m.emp_no, m.policy_id, m.created_at, m.guest_count, m.final_price,
                            m.is_void, m.auth_uid, m.path,
-                           e.emp_no, e.name AS emp_name, e.rf_card_uid, e.department_id,
+                           e.name AS emp_name, e.rf_card_uid, e.department_code,
                            d.name AS dept_name, p.meal_type, p.base_price
                     FROM meal_logs m
-                    JOIN employees e ON m.employee_id = e.id
-                    LEFT JOIN departments d ON e.department_id = d.id
+                    JOIN employees e ON m.emp_no = e.emp_no
+                    LEFT JOIN departments d ON e.department_code = d.code
                     LEFT JOIN policies p ON m.policy_id = p.id
                     WHERE m.id = %s
                     """,
@@ -1278,7 +1612,7 @@ class LocalMealClient:
         with get_connection() as conn:
             cur = conn.cursor()
             cur.execute(
-                """SELECT id, company_id, meal_type, start_time, end_time,
+                """SELECT id, company_code, meal_type, start_time, end_time,
                           base_price, guest_price, is_active
                    FROM policies ORDER BY id"""
             )
@@ -1288,11 +1622,11 @@ class LocalMealClient:
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                cid = data.get("company_id")
+                cid = (data.get("company_code") or "").strip() or None
                 if cid is None:
-                    cid = self._default_company_id(cur)
+                    cid = self._default_company_code(cur)
                 cur.execute(
-                    """INSERT INTO policies (company_id, meal_type, start_time, end_time, base_price, guest_price, is_active)
+                    """INSERT INTO policies (company_code, meal_type, start_time, end_time, base_price, guest_price, is_active)
                        VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         cid,
@@ -1306,7 +1640,7 @@ class LocalMealClient:
                 )
                 pid = cur.lastrowid
                 cur.execute(
-                    """SELECT id, company_id, meal_type, start_time, end_time,
+                    """SELECT id, company_code, meal_type, start_time, end_time,
                               base_price, guest_price, is_active
                        FROM policies WHERE id = %s""",
                     (pid,),
@@ -1334,7 +1668,7 @@ class LocalMealClient:
                     ),
                 )
                 cur.execute(
-                    """SELECT id, company_id, meal_type, start_time, end_time,
+                    """SELECT id, company_code, meal_type, start_time, end_time,
                               base_price, guest_price, is_active
                        FROM policies WHERE id = %s""",
                     (policy_id,),

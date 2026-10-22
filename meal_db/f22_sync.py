@@ -9,6 +9,23 @@ from typing import Any, Dict, List, Tuple
 from meal_db.f22_att_mode import f22_att_mode_is_adms
 
 
+def sync_terminal_name(t: dict) -> str:
+    """동기화 결과에 쓸 단말 이름. 번호 · 설치위치 · IP."""
+    if not isinstance(t, dict):
+        return "단말"
+    dno = str(t.get("device_no") or t.get("terminal_no") or "").strip()
+    loc = str(t.get("install_location") or "").strip()
+    ip = str(t.get("ip") or t.get("host") or "").strip()
+    bits = []
+    if dno:
+        bits.append("%s번" % dno)
+    if loc:
+        bits.append(loc)
+    if ip:
+        bits.append(ip)
+    return " · ".join(bits) if bits else "단말"
+
+
 def _terminals_for_sync(
     settings: Dict[str, Any] | None,
     terminals_only: list | None = None,
@@ -116,6 +133,7 @@ def sync_fingerprint_to_f22_terminals(
             port = int(t.get("port") or 4370)
         except (TypeError, ValueError):
             port = 4370
+        label = sync_terminal_name(t)
         ok, msg = f22_pyzk.push_fingerprint_to_terminal(
             ip,
             port,
@@ -130,7 +148,7 @@ def sync_fingerprint_to_f22_terminals(
             template_bytes_4,
             _template_slot_fids_arg(slot_fid_1, slot_fid_2, slot_fid_3, slot_fid_4),
         )
-        out.append((ip, ok, msg))
+        out.append((label, ok, msg))
     return out
 
 
@@ -233,6 +251,7 @@ def sync_employee_to_f22_terminals(
             port = int(t.get("port") or 4370)
         except (TypeError, ValueError):
             port = 4370
+        label = sync_terminal_name(t)
         ok, msg = f22_pyzk.push_fingerprint_to_terminal(
             ip,
             port,
@@ -247,7 +266,7 @@ def sync_employee_to_f22_terminals(
             template_bytes_4,
             _template_slot_fids_arg(slot_fid_1, slot_fid_2, slot_fid_3, slot_fid_4),
         )
-        out.append((ip, ok, msg))
+        out.append((label, ok, msg))
     return out
 
 
@@ -288,6 +307,7 @@ def remove_employee_from_f22_terminals(
             port = int(t.get("port") or 4370)
         except (TypeError, ValueError):
             port = 4370
+        label = sync_terminal_name(t)
         ok, msg = f22_pyzk.remove_user_from_terminal(ip, port, pwd, eno)
-        out.append((ip, ok, msg))
+        out.append((label, ok, msg))
     return out
